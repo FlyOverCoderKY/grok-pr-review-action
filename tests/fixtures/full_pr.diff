@@ -1,0 +1,26 @@
+diff --git a/legacy/feature.py b/legacy/feature.py
+index 1111111..2222222 100644
+--- a/legacy/feature.py
++++ b/legacy/feature.py
+@@ -1,5 +1,12 @@
+ def existing():
+     return 1
++
++
++def unique_full_pr_change():
++    # UNIQUE_FULL_PR_HUNK — this line belongs only to the full PR diff fixture.
++    leftover_from_the_original_branch = True
++    return leftover_from_the_original_branch
++
+diff --git a/legacy/second.py b/legacy/second.py
+new file mode 100644
+index 0000000..3333333
+--- /dev/null
++++ b/legacy/second.py
+@@ -0,0 +1,6 @@
++# Another file that exists only on the full pull request.
++FULL_PR_ONLY_FILE = True
++
++
++def leftover_helper():
++    return FULL_PR_ONLY_FILE
