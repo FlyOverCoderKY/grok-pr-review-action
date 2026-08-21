@@ -1,0 +1,11 @@
+diff --git a/followup.py b/followup.py
+new file mode 100644
+index 0000000..4444444
+--- /dev/null
++++ b/followup.py
+@@ -0,0 +1,5 @@
++# UNIQUE_LATEST_COMMIT_HUNK — this line belongs only to the latest-commit fixture.
++def follow_up_change():
++    return "only the new work on this push"
++
++

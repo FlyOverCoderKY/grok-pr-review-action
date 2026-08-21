@@ -1,0 +1,203 @@
+name: "Grok PR Review"
+description: >-
+  xAI Grok pull request reviews with a full-PR first pass or a latest-commit
+  follow-up. Authenticates with XAI_API_KEY against api.x.ai only.
+author: "Nathan / RetireGolden, LLC"
+branding:
+  icon: "eye"
+  color: "purple"
+
+inputs:
+  github_token:
+    description: "Token used to read the PR and post comments/reviews."
+    required: false
+    default: ${{ github.token }}
+  pr_number:
+    description: "PR number to review. Defaults to the PR that triggered the workflow."
+    required: false
+    default: ""
+  model:
+    description: "xAI model id (default grok-4.6)."
+    required: false
+    default: "grok-4.6"
+  effort:
+    description: "Reasoning effort: low | medium | high | xhigh. Empty = CLI default."
+    required: false
+    default: ""
+  max_turns:
+    description: "Maximum agentic turns for the headless grok run."
+    required: false
+    default: "50"
+  fail_on:
+    description: "When to fail the check: never | bugs | any."
+    required: false
+    default: "never"
+  roast_level:
+    description: "Comment tone: professional | playful | savage | diabolical."
+    required: false
+    default: "professional"
+  custom_instructions:
+    description: "Extra review instructions injected into the prompt."
+    required: false
+    default: ""
+  status_comments:
+    description: "Post/update a live status comment on the PR."
+    required: false
+    default: "true"
+  max_diff_kb:
+    description: "Maximum diff size (KB) embedded in the prompt before truncation."
+    required: false
+    default: "300"
+  review_scope:
+    description: >-
+      Diff to embed: full-pr (gh pr diff) or latest-commit (only the new
+      work on this push). latest-commit never silently falls back to the
+      full PR diff.
+    required: false
+    default: "full-pr"
+
+outputs:
+  verdict:
+    description: "Review verdict: clean | issues | error"
+    value: ${{ steps.finish.outputs.verdict }}
+  issue_count:
+    description: "Total number of issues found."
+    value: ${{ steps.finish.outputs.issue_count }}
+  bug_count:
+    description: "Number of bug-severity issues found."
+    value: ${{ steps.finish.outputs.bug_count }}
+  review_url:
+    description: "URL of the posted GitHub review or incomplete-review comment."
+    value: ${{ steps.finish.outputs.review_url }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Prepare workdirs
+      shell: bash
+      run: |
+        echo "GROK_HOME=$RUNNER_TEMP/grok-home" >> "$GITHUB_ENV"
+        echo "WORK=$RUNNER_TEMP/grok-pr-review" >> "$GITHUB_ENV"
+        mkdir -p "$RUNNER_TEMP/grok-home" "$RUNNER_TEMP/grok-pr-review"
+
+    - name: Require XAI_API_KEY
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/src
+      run: python3 -m grok_pr_review check-auth
+
+    - name: Install Grok CLI
+      shell: bash
+      run: |
+        if command -v grok >/dev/null 2>&1; then
+          echo "grok already installed"
+        else
+          curl -fsSL https://x.ai/cli/install.sh | bash
+        fi
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
+        grok --version
+
+    - name: Write Grok config.toml
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/src
+        MODEL: ${{ inputs.model }}
+      run: python3 -m grok_pr_review write-config
+
+    - name: Collect PR context
+      id: ctx
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/src
+        GH_TOKEN: ${{ inputs.github_token }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        REVIEW_SCOPE: ${{ inputs.review_scope }}
+        MAX_DIFF_KB: ${{ inputs.max_diff_kb }}
+        EVENT_BEFORE: ${{ github.event.before }}
+        EVENT_AFTER: ${{ github.event.after }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: python3 -m grok_pr_review collect
+
+    - name: Post status comment
+      if: ${{ inputs.status_comments == 'true' }}
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/src
+        GH_TOKEN: ${{ inputs.github_token }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        REVIEW_SCOPE: ${{ inputs.review_scope }}
+        MODEL: ${{ inputs.model }}
+        STATUS_COMMENTS: ${{ inputs.status_comments }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: python3 -m grok_pr_review start-status
+
+    - name: Build prompt
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/src
+        REVIEW_SCOPE: ${{ inputs.review_scope }}
+        MAX_DIFF_KB: ${{ inputs.max_diff_kb }}
+        ROAST_LEVEL: ${{ inputs.roast_level }}
+        CUSTOM_INSTRUCTIONS: ${{ inputs.custom_instructions }}
+      run: python3 -m grok_pr_review prompt
+
+    - name: Run Grok review
+      shell: bash
+      env:
+        MODEL: ${{ inputs.model }}
+        EFFORT: ${{ inputs.effort }}
+        MAX_TURNS: ${{ inputs.max_turns }}
+        GROK_DISABLE_AUTOUPDATER: "1"
+      run: |
+        EXTRA_ARGS=()
+        if [ -n "$MODEL" ]; then
+          EXTRA_ARGS+=(-m "$MODEL")
+        fi
+        if [ -n "$EFFORT" ]; then
+          EXTRA_ARGS+=(--effort "$EFFORT")
+        fi
+
+        set +e
+        grok --prompt-file "$WORK/prompt.md" \
+          --output-format json \
+          --yolo \
+          --tools "read_file,grep,list_dir" \
+          --disallowed-tools "run_terminal_cmd,web_search,web_fetch,search_replace" \
+          --max-turns "$MAX_TURNS" \
+          --no-auto-update \
+          --cwd "$GITHUB_WORKSPACE" \
+          "${EXTRA_ARGS[@]}" \
+          > "$WORK/grok-output.json" \
+          2> "$WORK/grok-stderr.log"
+        echo "$?" > "$WORK/grok-exit"
+        set -e
+
+        echo "grok exit code: $(cat "$WORK/grok-exit")"
+        echo "--- last stderr lines ---"
+        tail -n 30 "$WORK/grok-stderr.log" || true
+
+    - name: Post review
+      id: finish
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/src
+        GH_TOKEN: ${{ inputs.github_token }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        REVIEW_SCOPE: ${{ inputs.review_scope }}
+        MODEL: ${{ inputs.model }}
+        FAIL_ON: ${{ inputs.fail_on }}
+        STATUS_COMMENTS: ${{ inputs.status_comments }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: python3 -m grok_pr_review finish
+
+    - name: Cleanup credentials
+      if: ${{ always() }}
+      shell: bash
+      run: |
+        rm -rf "${GROK_HOME:-$RUNNER_TEMP/grok-home}"
+        rm -f "$HOME/.grok/config.toml" "$HOME/.grok/auth.json"
