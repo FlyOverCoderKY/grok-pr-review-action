@@ -38,6 +38,10 @@ def test_action_yml_uses_xai_api_key_not_supergrok() -> None:
     assert "scripts/cleanup-workdir.sh" in text
     assert "--sandbox strict" in run_script
     assert "--sandbox off" not in run_script
+    assert 'sandbox_prompt="$sandbox_prompt_dir/prompt.md"' in run_script
+    assert ".grok-pr-review" in run_script
+    assert 'cp -- "$prompt" "$sandbox_prompt"' in run_script
+    assert '--prompt-file "$sandbox_prompt"' in run_script
     assert "--no-subagents" in run_script
     assert "--disable-web-search" in run_script
     assert 'GROK_VERSION="1.0.5"' in install_script
@@ -104,3 +108,6 @@ def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     assert "apparmor_restrict_unprivileged_userns" in unreleased
     assert "bwrap-userns-restrict" in unreleased
     assert "v1.0.2" in unreleased
+    assert "v1.0.3" in unreleased
+    assert ".grok-pr-review/prompt.md" in unreleased
+    assert "Permission denied (os error 13)" in unreleased
