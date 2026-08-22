@@ -58,7 +58,7 @@ inputs:
 
 outputs:
   verdict:
-    description: "Review verdict: clean | issues | error"
+    description: "Review verdict: clean | issues | partial | error"
     value: ${{ steps.finish.outputs.verdict }}
   issue_count:
     description: "Total number of issues found."
@@ -74,11 +74,13 @@ runs:
   using: "composite"
   steps:
     - name: Prepare workdirs
+      id: dirs
       shell: bash
       run: |
-        echo "GROK_HOME=$RUNNER_TEMP/grok-home" >> "$GITHUB_ENV"
-        echo "WORK=$RUNNER_TEMP/grok-pr-review" >> "$GITHUB_ENV"
-        mkdir -p "$RUNNER_TEMP/grok-home" "$RUNNER_TEMP/grok-pr-review"
+        WORK="$(mktemp -d "$RUNNER_TEMP/grok-pr-review.XXXXXX")"
+        mkdir -p "$WORK/grok-home" "$WORK/bin"
+        echo "work=$WORK" >> "$GITHUB_OUTPUT"
+        echo "grok_home=$WORK/grok-home" >> "$GITHUB_OUTPUT"
 
     - name: Require XAI_API_KEY
       shell: bash
@@ -88,21 +90,42 @@ runs:
 
     - name: Install Grok CLI
       shell: bash
+      env:
+        WORK: ${{ steps.dirs.outputs.work }}
       run: |
-        if command -v grok >/dev/null 2>&1; then
-          echo "grok already installed"
-        else
-          curl -fsSL https://x.ai/cli/install.sh | bash
+        GROK_VERSION="1.0.5"
+        if [ "$(uname -s)" != "Linux" ]; then
+          echo "This action currently supports Linux runners only." >&2
+          exit 1
         fi
-        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-        echo "$HOME/.grok/bin" >> "$GITHUB_PATH"
-        export PATH="$HOME/.local/bin:$HOME/.grok/bin:$PATH"
-        grok --version
+        case "$(uname -m)" in
+          x86_64|amd64)
+            GROK_ARCH="x86_64"
+            GROK_SHA256="9ba87444e1819e8f6104adbbf4676a870c204380aa5c3e1c38a926c4ea677238"
+            ;;
+          arm64|aarch64)
+            GROK_ARCH="aarch64"
+            GROK_SHA256="1c1fe67d7c35497fb09f44a451f57acc3787add4c9aea2c56f5c7c75dc5ffcf1"
+            ;;
+          *)
+            echo "Unsupported Linux architecture: $(uname -m)" >&2
+            exit 1
+            ;;
+        esac
+        GROK_DOWNLOAD="$WORK/bin/grok.download"
+        curl --proto '=https' --tlsv1.2 --retry 3 -fsSL \
+          "https://x.ai/cli/grok-${GROK_VERSION}-linux-${GROK_ARCH}" \
+          -o "$GROK_DOWNLOAD"
+        echo "$GROK_SHA256  $GROK_DOWNLOAD" | sha256sum --check --status
+        mv "$GROK_DOWNLOAD" "$WORK/bin/grok"
+        chmod 0755 "$WORK/bin/grok"
+        "$WORK/bin/grok" --version
 
     - name: Write Grok config.toml
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
+        GROK_HOME: ${{ steps.dirs.outputs.grok_home }}
         MODEL: ${{ inputs.model }}
       run: python3 -m grok_pr_review write-config
 
@@ -111,6 +134,7 @@ runs:
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
+        WORK: ${{ steps.dirs.outputs.work }}
         GH_TOKEN: ${{ inputs.github_token }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
@@ -121,11 +145,20 @@ runs:
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       run: python3 -m grok_pr_review collect
 
+    - name: Prepare isolated review workspace
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/src
+        WORK: ${{ steps.dirs.outputs.work }}
+        SOURCE_WORKSPACE: ${{ github.workspace }}
+      run: python3 -m grok_pr_review prepare-workspace
+
     - name: Post status comment
       if: ${{ inputs.status_comments == 'true' }}
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
+        WORK: ${{ steps.dirs.outputs.work }}
         GH_TOKEN: ${{ inputs.github_token }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
@@ -139,6 +172,7 @@ runs:
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
+        WORK: ${{ steps.dirs.outputs.work }}
         REVIEW_SCOPE: ${{ inputs.review_scope }}
         MAX_DIFF_KB: ${{ inputs.max_diff_kb }}
         ROAST_LEVEL: ${{ inputs.roast_level }}
@@ -148,6 +182,8 @@ runs:
     - name: Run Grok review
       shell: bash
       env:
+        GROK_HOME: ${{ steps.dirs.outputs.grok_home }}
+        WORK: ${{ steps.dirs.outputs.work }}
         MODEL: ${{ inputs.model }}
         EFFORT: ${{ inputs.effort }}
         MAX_TURNS: ${{ inputs.max_turns }}
@@ -162,14 +198,18 @@ runs:
         fi
 
         set +e
-        grok --prompt-file "$WORK/prompt.md" \
+        "$WORK/bin/grok" --prompt-file "$WORK/prompt.md" \
           --output-format json \
           --yolo \
+          --sandbox strict \
+          --no-subagents \
+          --no-memory \
+          --disable-web-search \
           --tools "read_file,grep,list_dir" \
-          --disallowed-tools "run_terminal_cmd,web_search,web_fetch,search_replace" \
+          --disallowed-tools "run_terminal_cmd,web_search,web_fetch,search_replace,Agent" \
           --max-turns "$MAX_TURNS" \
           --no-auto-update \
-          --cwd "$GITHUB_WORKSPACE" \
+          --cwd "$WORK/workspace" \
           "${EXTRA_ARGS[@]}" \
           > "$WORK/grok-output.json" \
           2> "$WORK/grok-stderr.log"
@@ -185,6 +225,7 @@ runs:
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
+        WORK: ${{ steps.dirs.outputs.work }}
         GH_TOKEN: ${{ inputs.github_token }}
         GITHUB_TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
@@ -195,9 +236,13 @@ runs:
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
       run: python3 -m grok_pr_review finish
 
-    - name: Cleanup credentials
+    - name: Cleanup temporary files
       if: ${{ always() }}
       shell: bash
+      env:
+        WORK: ${{ steps.dirs.outputs.work }}
       run: |
-        rm -rf "${GROK_HOME:-$RUNNER_TEMP/grok-home}"
-        rm -f "$HOME/.grok/config.toml" "$HOME/.grok/auth.json"
+        case "${WORK:-}" in
+          "$RUNNER_TEMP"/grok-pr-review.*) rm -rf -- "$WORK" ;;
+          *) echo "Refusing to clean unexpected path: ${WORK:-<empty>}" >&2; exit 1 ;;
+        esac

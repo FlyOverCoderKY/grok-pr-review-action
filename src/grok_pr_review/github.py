@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
+
+# Calls use fixed argv lists and never invoke a shell.
+import subprocess  # nosec B404
 from typing import Any
 
 from grok_pr_review.result import (
@@ -35,20 +37,23 @@ class GitHubCli:
                 "number,title,body,url,author,headRefOid,baseRefName,headRefName,additions,deletions,changedFiles",
             ]
         )
-        data = json.loads(raw)
-        if not isinstance(data, dict):
-            raise GhError("gh pr view returned unexpected JSON")
-        return data
+        return _json_object(raw, "gh pr view returned unexpected JSON")
 
     def pr_diff(self, number: int) -> str:
         return self._run(["pr", "diff", str(number), "--repo", self.repo])
 
     def compare_diff(self, before: str, after: str) -> str:
+        endpoint = f"repos/{self.repo}/compare/{before}...{after}"
+        comparison = _json_object(self._api([endpoint]), "could not parse commit comparison")
+        status = comparison.get("status")
+        behind_by = comparison.get("behind_by")
+        if status != "ahead" or behind_by not in {0, None}:
+            raise GhError("commit comparison is not a linear fast-forward range")
         return self._api(
             [
                 "-H",
                 "Accept: application/vnd.github.diff",
-                f"repos/{self.repo}/compare/{before}...{after}",
+                endpoint,
             ]
         )
 
@@ -62,14 +67,19 @@ class GitHubCli:
         )
 
     def find_status_comment(self, pr_number: int) -> int | None:
-        raw = self._api(["--paginate", f"repos/{self.repo}/issues/{pr_number}/comments"])
+        raw = self._api(["--paginate", "--slurp", f"repos/{self.repo}/issues/{pr_number}/comments"])
         try:
-            comments = json.loads(raw)
+            payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise GhError("could not parse issue comments") from exc
-        if not isinstance(comments, list):
+        if not isinstance(payload, list):
             return None
-        for comment in comments:
+        comments = (
+            [comment for page in payload for comment in page]
+            if payload and all(isinstance(page, list) for page in payload)
+            else payload
+        )
+        for comment in reversed(comments):
             if not isinstance(comment, dict):
                 continue
             body = comment.get("body")
@@ -91,17 +101,28 @@ class GitHubCli:
                 ]
             )
         else:
-            raw = self._api(
-                [
-                    "--method",
-                    "PATCH",
-                    f"repos/{self.repo}/issues/comments/{comment_id}",
-                    "-f",
-                    f"body={text}",
-                ]
-            )
-        data = json.loads(raw)
-        ident = data.get("id") if isinstance(data, dict) else None
+            try:
+                raw = self._api(
+                    [
+                        "--method",
+                        "PATCH",
+                        f"repos/{self.repo}/issues/comments/{comment_id}",
+                        "-f",
+                        f"body={text}",
+                    ]
+                )
+            except GhError:
+                raw = self._api(
+                    [
+                        "--method",
+                        "POST",
+                        f"repos/{self.repo}/issues/{pr_number}/comments",
+                        "-f",
+                        f"body={text}",
+                    ]
+                )
+        data = _json_object(raw, "status comment response was invalid")
+        ident = data.get("id")
         if not isinstance(ident, int):
             raise GhError("status comment response missing id")
         return ident
@@ -116,8 +137,8 @@ class GitHubCli:
                 f"body={body}",
             ]
         )
-        data = json.loads(raw)
-        url = data.get("html_url") if isinstance(data, dict) else None
+        data = _json_object(raw, "issue comment response was invalid")
+        url = data.get("html_url")
         return url if isinstance(url, str) else ""
 
     def post_review(
@@ -174,8 +195,8 @@ class GitHubCli:
             ],
             stdin=json.dumps(payload),
         )
-        data = json.loads(raw)
-        url = data.get("html_url") if isinstance(data, dict) else None
+        data = _json_object(raw, "review response was invalid")
+        url = data.get("html_url")
         return url if isinstance(url, str) else ""
 
     def _run(self, args: list[str]) -> str:
@@ -185,7 +206,8 @@ class GitHubCli:
         return self._exec(["gh", "api", *args], stdin=stdin)
 
     def _exec(self, argv: list[str], stdin: str | None = None) -> str:
-        completed = subprocess.run(
+        # argv is passed directly and is never interpreted by a shell.
+        completed = subprocess.run(  # nosec B603
             argv,
             check=False,
             capture_output=True,
@@ -197,3 +219,13 @@ class GitHubCli:
             detail = (completed.stderr or completed.stdout or "gh failed").strip()
             raise GhError(detail[-2000:])
         return completed.stdout
+
+
+def _json_object(raw: str, message: str) -> dict[str, Any]:
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise GhError(message) from exc
+    if not isinstance(data, dict):
+        raise GhError(message)
+    return data

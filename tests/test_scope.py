@@ -205,3 +205,34 @@ def test_truncate_diff_keeps_small_payloads() -> None:
     assert result.truncated is False
     assert result.notice is None
     assert result.text == LATEST_DIFF
+
+
+def test_truncate_diff_stops_at_a_file_boundary() -> None:
+    first = "diff --git a/first.py b/first.py\n" + ("+first\n" * 100)
+    second = "diff --git a/second.py b/second.py\n" + ("+second\n" * 100)
+    result = truncate_diff(first + second, max_diff_kb=1)
+    assert result.truncated is True
+    assert "first.py" in result.text
+    assert "second.py" not in result.text
+    assert result.text == first
+
+
+def test_full_pr_fails_if_head_changes_during_collection() -> None:
+    class MovingHead(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.views = 0
+
+        def pr_view(self, number: int) -> dict[str, object]:
+            self.views += 1
+            sha = AFTER if self.views == 1 else "c" * 40
+            self.calls.append(("pr_view", (str(number),)))
+            return {"number": number, "headRefOid": sha}
+
+    with pytest.raises(GhError, match="PR head changed"):
+        collect_review_material(
+            pr_number=7,
+            request=DiffRequest(scope="full-pr", before_sha=None, after_sha=None, head_sha=AFTER),
+            max_diff_kb=300,
+            github=MovingHead(),
+        )
