@@ -97,10 +97,8 @@ def test_readme_explains_latest_commit_and_auth() -> None:
     assert "Start only after first-pass has completed" in text
     assert "Do not require the follow-up job" in text
     assert "org reusable caller" in text
-    assert (
-        "Add a `concurrency` group with `cancel-in-progress: true` to avoid paying for superseded runs."
-        not in text
-    )
+    stale = "cancel-in-progress: true` to avoid paying for superseded runs."
+    assert stale not in text
 
 
 def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
