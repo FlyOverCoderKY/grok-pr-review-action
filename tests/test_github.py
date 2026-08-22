@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 
 from grok_pr_review.github import STATUS_MARKER, GitHubCli
-from grok_pr_review.result import Issue, ReviewResult
+from grok_pr_review.result import MAX_GITHUB_BODY_BYTES, Issue, ReviewResult
 from grok_pr_review.scope import GhError
 
 
@@ -98,6 +98,7 @@ def test_exec_uses_an_argument_vector_and_converts_failures(
     assert github.pr_diff(7) == "ok"
     assert captured["argv"] == ["gh", "pr", "diff", "7", "--repo", "owner/repo"]
     assert captured["check"] is False
+    assert captured["timeout"] == 120
     assert "shell" not in captured
 
     def failed_run(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
@@ -106,3 +107,54 @@ def test_exec_uses_an_argument_vector_and_converts_failures(
     monkeypatch.setattr(subprocess, "run", failed_run)
     with pytest.raises(GhError, match="denied"):
         github.pr_diff(7)
+
+
+def test_exec_converts_timeouts_and_missing_executables(monkeypatch: pytest.MonkeyPatch) -> None:
+    def timed_out(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(argv, 17)
+
+    monkeypatch.setattr(subprocess, "run", timed_out)
+    github = GitHubCli("owner/repo", env={}, timeout_seconds=17)
+    with pytest.raises(GhError, match="timed out after 17 seconds"):
+        github.pr_diff(7)
+
+    def missing(argv: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise FileNotFoundError(argv[0])
+
+    monkeypatch.setattr(subprocess, "run", missing)
+    with pytest.raises(GhError, match="could not start"):
+        github.pr_diff(7)
+
+
+def test_post_review_continues_large_aggregate_output_without_losing_findings() -> None:
+    github = StubGitHub()
+    github.responses = [
+        json.dumps({"html_url": "https://review"}),
+        json.dumps({"html_url": "https://comment"}),
+    ]
+    result = ReviewResult(
+        verdict="issues",
+        summary="Large review.",
+        issues=[Issue("risk", None, None, f"Finding {index}", "x" * 8_000) for index in range(8)],
+    )
+
+    assert (
+        github.post_review(7, "a" * 40, result, scope="full-pr", model="grok-4.6", run_url="")
+        == "https://review"
+    )
+    review_payload = json.loads(github.calls[0][1] or "{}")
+    continuation_arg = next(value for value in github.calls[1][0] if value.startswith("body="))
+    bodies = [review_payload["body"], continuation_arg.removeprefix("body=")]
+    aggregate = "\n".join(bodies)
+    assert all(len(body.encode("utf-8")) <= MAX_GITHUB_BODY_BYTES for body in bodies)
+    for index in range(8):
+        assert f"Finding {index}" in aggregate
+
+
+def test_status_comment_body_is_bounded() -> None:
+    github = StubGitHub()
+    github.responses = [json.dumps({"id": 9})]
+
+    assert github.upsert_status_comment(7, "🔍" * 20_000, None) == 9
+    body_arg = next(value for value in github.calls[0][0] if value.startswith("body="))
+    assert len(body_arg.removeprefix("body=").encode("utf-8")) <= MAX_GITHUB_BODY_BYTES

@@ -4,11 +4,12 @@ version = "0.1.0"
 description = "Public GitHub Action for xAI Grok pull request reviews with full-PR and latest-commit scopes."
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.15"
 authors = [{ name = "Nathan / RetireGolden, LLC" }]
 
 [project.optional-dependencies]
 dev = [
+  "bandit==1.9.4",
   "coverage==7.15.4",
   "mypy==2.3.1",
   "pytest==9.1.1",

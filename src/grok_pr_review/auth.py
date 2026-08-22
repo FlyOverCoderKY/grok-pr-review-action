@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
+from grok_pr_review.config import ConfigError, parse_model
+
 XAI_BASE_URL = "https://api.x.ai/v1"
-_MODEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class AuthError(ValueError):
@@ -29,9 +29,10 @@ def require_xai_api_key(env: dict[str, str] | None = None) -> None:
 
 def render_config_toml(model: str) -> str:
     """Return ~/.grok/config.toml contents that pin the model to api.x.ai."""
-    chosen = model.strip()
-    if not chosen or not _MODEL_RE.fullmatch(chosen):
-        raise AuthError("model must be a non-empty identifier matching [A-Za-z0-9._-]+")
+    try:
+        chosen = parse_model(model)
+    except ConfigError as exc:
+        raise AuthError(str(exc)) from exc
     return (
         "[cli]\n"
         "auto_update = false\n"

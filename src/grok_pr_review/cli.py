@@ -5,34 +5,49 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from grok_pr_review.auth import require_xai_api_key, write_grok_config
+from grok_pr_review.artifacts import ArtifactError, ReviewContext
+from grok_pr_review.auth import AuthError, require_xai_api_key, write_grok_config
+from grok_pr_review.config import (
+    MAX_DIFF_KB,
+    MAX_GITHUB_TIMEOUT_SECONDS,
+    ActionConfig,
+    ConfigError,
+    parse_bool,
+    parse_bounded_int,
+    parse_custom_instructions,
+    parse_fail_on,
+    parse_model,
+    parse_review_scope,
+    parse_roast_level,
+)
 from grok_pr_review.github import GitHubCli
-from grok_pr_review.prompt import PromptContext, build_prompt
+from grok_pr_review.prompt import build_prompt_from_collected
 from grok_pr_review.result import (
     ReviewResult,
+    format_pipeline_failure_comment,
     mark_partial,
     neutralize_mentions,
     parse_grok_output,
     should_fail_job,
 )
 from grok_pr_review.scope import (
-    DiffPlan,
     DiffRequest,
     GhError,
-    Truncation,
     collect_review_material,
     normalize_sha,
-    parse_scope,
 )
-from grok_pr_review.workspace import prepare_review_workspace
+from grok_pr_review.workspace import WorkspaceError, prepare_review_workspace
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="grok-pr-review")
     sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("validate-inputs", help="Validate every composite-action input")
     sub.add_parser("check-auth", help="Fail closed when XAI_API_KEY is empty")
     sub.add_parser("write-config", help="Write GROK_HOME/config.toml for api.x.ai")
     sub.add_parser("collect", help="Fetch PR metadata and the scoped diff")
@@ -44,6 +59,7 @@ def main(argv: list[str] | None = None) -> int:
 
     commands = {
         "check-auth": cmd_check_auth,
+        "validate-inputs": cmd_validate_inputs,
         "write-config": cmd_write_config,
         "collect": cmd_collect,
         "prepare-workspace": cmd_prepare_workspace,
@@ -51,7 +67,21 @@ def main(argv: list[str] | None = None) -> int:
         "start-status": cmd_start_status,
         "finish": cmd_finish,
     }
-    return commands[args.command]()
+    try:
+        return commands[args.command]()
+    except (ArtifactError, AuthError, ConfigError, GhError, WorkspaceError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+
+def cmd_validate_inputs() -> int:
+    config = ActionConfig.from_env(os.environ)
+    print(
+        "Validated action inputs "
+        f"(pr={config.pr_number}, scope={config.review_scope}, "
+        f"model={config.model}, max_turns={config.max_turns})."
+    )
+    return 0
 
 
 def cmd_check_auth() -> int:
@@ -63,7 +93,7 @@ def cmd_check_auth() -> int:
 def cmd_write_config() -> int:
     require_xai_api_key()
     grok_home = Path(_require_env("GROK_HOME"))
-    model = os.environ.get("MODEL", "grok-4.6").strip() or "grok-4.6"
+    model = parse_model(os.environ.get("MODEL", "grok-4.6"))
     path = write_grok_config(grok_home, model)
     print(f"Wrote {path} (api.x.ai, env_key=XAI_API_KEY).")
     return 0
@@ -72,40 +102,32 @@ def cmd_write_config() -> int:
 def cmd_collect() -> int:
     work = _work_dir()
     pr_number = _pr_number()
-    scope = parse_scope(os.environ.get("REVIEW_SCOPE", "full-pr"))
-    max_diff_kb = _positive_int(os.environ.get("MAX_DIFF_KB", "300"), "MAX_DIFF_KB")
+    scope = parse_review_scope(os.environ.get("REVIEW_SCOPE", "full-pr"))
+    max_diff_kb = parse_bounded_int(
+        os.environ.get("MAX_DIFF_KB", "300"),
+        "max_diff_kb",
+        minimum=1,
+        maximum=MAX_DIFF_KB,
+    )
     before, after, head = _event_shas()
     github = _github()
-    collected = collect_review_material(
-        pr_number=pr_number,
-        request=DiffRequest(
-            scope=scope,
-            before_sha=before,
-            after_sha=after,
-            head_sha=head,
-        ),
-        max_diff_kb=max_diff_kb,
-        github=github,
-    )
-    (work / "pr.json").write_text(json.dumps(collected.pr, indent=2), encoding="utf-8")
+    try:
+        collected = collect_review_material(
+            pr_number=pr_number,
+            request=DiffRequest(
+                scope=scope,
+                before_sha=before,
+                after_sha=after,
+                head_sha=head,
+            ),
+            max_diff_kb=max_diff_kb,
+            github=github,
+        )
+    except (GhError, ValueError) as exc:
+        _report_pipeline_failure("diff collection", exc)
+        raise
     (work / "diff.patch").write_text(collected.diff, encoding="utf-8")
-    (work / "scope.json").write_text(
-        json.dumps(
-            {
-                "scope": collected.plan.scope,
-                "kind": collected.plan.kind,
-                "from_sha": collected.plan.from_sha,
-                "to_sha": collected.plan.to_sha,
-                "fallback_notice": collected.plan.fallback_notice,
-                "truncated": collected.truncation.truncated,
-                "truncation_notice": collected.truncation.notice,
-                "original_bytes": collected.truncation.original_bytes,
-                "embedded_bytes": collected.truncation.embedded_bytes,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    ReviewContext.from_collected(collected).write(work / "review-context.json")
     print(
         f"Collected {collected.plan.kind} diff "
         f"({collected.truncation.embedded_bytes} bytes embedded)."
@@ -119,31 +141,20 @@ def cmd_collect() -> int:
 
 def cmd_prompt() -> int:
     work = _work_dir()
-    pr = json.loads((work / "pr.json").read_text(encoding="utf-8"))
-    scope = json.loads((work / "scope.json").read_text(encoding="utf-8"))
+    context = ReviewContext.read(work / "review-context.json")
     diff = (work / "diff.patch").read_text(encoding="utf-8")
-    plan = DiffPlan(
-        scope=scope["scope"],
-        kind=scope["kind"],
-        from_sha=scope.get("from_sha"),
-        to_sha=scope.get("to_sha"),
-        fallback_notice=scope.get("fallback_notice"),
+    allow_unprofessional = parse_bool(
+        os.environ.get("ALLOW_UNPROFESSIONAL_TONE", "false"),
+        "allow_unprofessional_tone",
     )
-    truncation = Truncation(
-        text=diff,
-        truncated=bool(scope.get("truncated")),
-        original_bytes=int(scope.get("original_bytes") or len(diff.encode())),
-        embedded_bytes=int(scope.get("embedded_bytes") or len(diff.encode())),
-        max_diff_kb=_positive_int(os.environ.get("MAX_DIFF_KB", "300"), "MAX_DIFF_KB"),
-    )
-    text = build_prompt(
-        PromptContext(
-            pr=pr,
-            plan=plan,
-            truncation=truncation,
-            roast_level=os.environ.get("ROAST_LEVEL", "professional"),
-            custom_instructions=os.environ.get("CUSTOM_INSTRUCTIONS", ""),
-        )
+    text = build_prompt_from_collected(
+        context.to_collected(diff),
+        roast_level=parse_roast_level(
+            os.environ.get("ROAST_LEVEL", "professional"),
+            allow_unprofessional=allow_unprofessional,
+        ),
+        custom_instructions=parse_custom_instructions(os.environ.get("CUSTOM_INSTRUCTIONS", "")),
+        allow_unprofessional_tone=allow_unprofessional,
     )
     (work / "prompt.md").write_text(text, encoding="utf-8")
     print(f"Wrote {work / 'prompt.md'} ({len(text.encode())} bytes).")
@@ -152,33 +163,33 @@ def cmd_prompt() -> int:
 
 def cmd_prepare_workspace() -> int:
     work = _work_dir()
-    source = Path(_require_env("SOURCE_WORKSPACE"))
-    destination = work / "workspace"
-    preparation = prepare_review_workspace(source, destination)
-    (work / "workspace.json").write_text(
-        json.dumps(
-            {
-                "files_copied": preparation.files_copied,
-                "excluded_paths": preparation.excluded_paths,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    try:
+        context = ReviewContext.read(work / "review-context.json")
+        source = Path(_require_env("SOURCE_WORKSPACE"))
+        destination = work / "workspace"
+        preparation = prepare_review_workspace(
+            source,
+            destination,
+            reviewed_sha=context.plan.to_sha or "",
+        )
+    except (ArtifactError, WorkspaceError) as exc:
+        _report_pipeline_failure("workspace preparation", exc)
+        raise
     print(
         f"Prepared inert review workspace with {preparation.files_copied} files "
-        f"({len(preparation.excluded_paths)} control or symlink paths excluded)."
+        f"({preparation.bytes_copied} bytes; "
+        f"{len(preparation.excluded_paths)} control or non-regular paths excluded)."
     )
     return 0
 
 
 def cmd_start_status() -> int:
-    if not _truthy(os.environ.get("STATUS_COMMENTS", "true")):
+    if not parse_bool(os.environ.get("STATUS_COMMENTS", "true"), "status_comments"):
         return 0
     work = _work_dir()
     pr_number = _pr_number()
-    scope = os.environ.get("REVIEW_SCOPE", "full-pr")
-    model = os.environ.get("MODEL", "grok-4.6")
+    scope = parse_review_scope(os.environ.get("REVIEW_SCOPE", "full-pr"))
+    model = parse_model(os.environ.get("MODEL", "grok-4.6"))
     run_url = os.environ.get("RUN_URL", "")
     body = f"Grokking PR #{pr_number} (`{scope}`, model `{model}`)…\n" + (
         f"\nWorkflow run: {run_url}\n" if run_url else ""
@@ -191,25 +202,64 @@ def cmd_start_status() -> int:
     return 0
 
 
+@dataclass(frozen=True)
+class FinishOutcome:
+    result: ReviewResult
+    review_url: str
+
+
 def cmd_finish() -> int:
     work = _work_dir()
     pr_number = _pr_number()
-    fail_on = os.environ.get("FAIL_ON", "never")
-    scope = os.environ.get("REVIEW_SCOPE", "full-pr")
-    model = os.environ.get("MODEL", "grok-4.6")
+    fail_on = parse_fail_on(os.environ.get("FAIL_ON", "never"))
+    scope = parse_review_scope(os.environ.get("REVIEW_SCOPE", "full-pr"))
+    model = parse_model(os.environ.get("MODEL", "grok-4.6"))
     run_url = os.environ.get("RUN_URL", "")
+    status_comments = parse_bool(os.environ.get("STATUS_COMMENTS", "true"), "status_comments")
+    context = ReviewContext.read(work / "review-context.json")
+    result = _parse_finish_result(work, context)
+    github = _github()
+    outcome = _post_finish_result(
+        github,
+        pr_number,
+        context,
+        result,
+        scope=scope,
+        model=model,
+        run_url=run_url,
+    )
+    return _finalize_finish(
+        github,
+        work,
+        pr_number,
+        outcome,
+        scope=scope,
+        fail_on=fail_on,
+        status_comments=status_comments,
+    )
+
+
+def _parse_finish_result(work: Path, context: ReviewContext) -> ReviewResult:
     raw = _read_optional(work / "grok-output.json")
     exit_code = _read_exit(work / "grok-exit")
     result = parse_grok_output(raw, exit_code=exit_code)
-    scope_data = _read_json_object(work / "scope.json")
-    if bool(scope_data.get("truncated")):
-        notice = scope_data.get("truncation_notice")
-        reason = notice if isinstance(notice, str) and notice.strip() else "The diff was truncated."
+    if context.truncated:
+        reason = context.truncation_notice or "The diff was truncated."
         result = mark_partial(result, reason)
+    return result
 
-    github = _github()
+
+def _post_finish_result(
+    github: GitHubCli,
+    pr_number: int,
+    context: ReviewContext,
+    result: ReviewResult,
+    *,
+    scope: str,
+    model: str,
+    run_url: str,
+) -> FinishOutcome:
     review_url = ""
-    posting_failed = False
     try:
         if result.incomplete:
             review_url = github.post_incomplete(
@@ -217,10 +267,7 @@ def cmd_finish() -> int:
             )
             print(result.incomplete_reason or "Review incomplete.")
         else:
-            pr = _read_json_object(work / "pr.json")
-            commit_id = normalize_sha(_maybe_str(scope_data.get("to_sha")))
-            if commit_id is None:
-                commit_id = normalize_sha(_maybe_str(pr.get("headRefOid")))
+            commit_id = normalize_sha(context.plan.to_sha)
             if commit_id is None:
                 raise GhError("reviewed commit SHA is missing")
 
@@ -251,18 +298,45 @@ def cmd_finish() -> int:
             issues=result.issues,
             incomplete_reason=reason,
             stop_reason=result.stop_reason,
+            partial_reason=result.partial_reason,
         )
-        posting_failed = True
+        try:
+            review_url = github.post_incomplete(
+                pr_number, result, scope=scope, model=model, run_url=run_url
+            )
+        except GhError as post_exc:
+            print(f"Could not post the incomplete-review comment: {post_exc}")
+    return FinishOutcome(result=result, review_url=review_url)
 
-    _update_status(github, work, pr_number, result, scope, review_url)
-    _write_outputs(result, review_url)
+
+def _finalize_finish(
+    github: GitHubCli,
+    work: Path,
+    pr_number: int,
+    outcome: FinishOutcome,
+    *,
+    scope: str,
+    fail_on: str,
+    status_comments: bool,
+) -> int:
+    result = outcome.result
+    _update_status(
+        github,
+        work,
+        pr_number,
+        result,
+        scope,
+        outcome.review_url,
+        enabled=status_comments,
+    )
+    _write_outputs(result, outcome.review_url)
     (work / "result.json").write_text(
         json.dumps(
             {
                 "verdict": result.verdict,
                 "issue_count": result.issue_count,
                 "bug_count": result.bug_count,
-                "review_url": review_url,
+                "review_url": outcome.review_url,
                 "incomplete_reason": result.incomplete_reason,
                 "partial_reason": result.partial_reason,
             },
@@ -271,10 +345,9 @@ def cmd_finish() -> int:
         encoding="utf-8",
     )
     print(f"verdict={result.verdict} issues={result.issue_count} bugs={result.bug_count}")
-    if posting_failed:
-        return 1
     if should_fail_job(fail_on, result):
-        print(f"Failing the job because fail_on={fail_on}.")
+        reason = "the review did not complete" if result.incomplete else f"fail_on={fail_on}"
+        print(f"Failing the job because {reason}.")
         return 1
     return 0
 
@@ -283,14 +356,15 @@ def _update_status(
     github: GitHubCli,
     work: Path,
     pr_number: int,
-    result: Any,
+    result: ReviewResult,
     scope: str,
     review_url: str,
+    *,
+    enabled: bool,
 ) -> None:
-    if not _truthy(os.environ.get("STATUS_COMMENTS", "true")):
+    if not enabled:
         return
     ident = _read_optional(work / "status-comment-id").strip()
-    comment_id = int(ident) if ident.isdigit() else github.find_status_comment(pr_number)
     summary = f"Grok review finished: `{result.verdict}` (scope `{scope}`)."
     if review_url:
         summary += f"\n\n{review_url}"
@@ -299,12 +373,13 @@ def _update_status(
     if result.partial_reason:
         summary += f"\n\nPartial review: {neutralize_mentions(result.partial_reason)}"
     try:
+        comment_id = int(ident) if ident.isdigit() else github.find_status_comment(pr_number)
         github.upsert_status_comment(pr_number, summary, comment_id)
     except GhError as exc:
         print(f"Could not update status comment: {exc}")
 
 
-def _write_outputs(result: Any, review_url: str) -> None:
+def _write_outputs(result: ReviewResult, review_url: str) -> None:
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
         return
@@ -315,6 +390,22 @@ def _write_outputs(result: Any, review_url: str) -> None:
         handle.write(f"review_url={review_url}\n")
 
 
+def _report_pipeline_failure(stage: str, exc: Exception) -> None:
+    """Best-effort visible PR comment when a step fails before finish can run."""
+    try:
+        github = _github()
+        github.post_issue_comment(
+            _pr_number(),
+            format_pipeline_failure_comment(
+                stage=stage,
+                reason=str(exc),
+                run_url=os.environ.get("RUN_URL", ""),
+            ),
+        )
+    except (GhError, SystemExit) as post_exc:
+        print(f"Could not post the pipeline-failure comment: {post_exc}", file=sys.stderr)
+
+
 def _github() -> GitHubCli:
     repo = _require_env("GITHUB_REPOSITORY")
     env = os.environ.copy()
@@ -322,7 +413,13 @@ def _github() -> GitHubCli:
     if token:
         env["GH_TOKEN"] = token
         env["GITHUB_TOKEN"] = token
-    return GitHubCli(repo, env=env)
+    timeout_seconds = parse_bounded_int(
+        os.environ.get("GITHUB_TIMEOUT_SECONDS", "120"),
+        "github_timeout_seconds",
+        minimum=1,
+        maximum=MAX_GITHUB_TIMEOUT_SECONDS,
+    )
+    return GitHubCli(repo, env=env, timeout_seconds=timeout_seconds)
 
 
 def _event_shas() -> tuple[str | None, str | None, str | None]:
@@ -360,11 +457,10 @@ def _pr_number() -> int:
                 return int(pull["number"])
     work = os.environ.get("WORK")
     if work:
-        pr_path = Path(work) / "pr.json"
-        if pr_path.is_file():
-            loaded = json.loads(pr_path.read_text(encoding="utf-8"))
-            number = loaded.get("number") if isinstance(loaded, dict) else None
-            if isinstance(number, int):
+        context_path = Path(work) / "review-context.json"
+        if context_path.is_file():
+            number = ReviewContext.read(context_path).pr.get("number")
+            if isinstance(number, int) and not isinstance(number, bool):
                 return number
     raise SystemExit("No PR number. Trigger on pull_request or pass pr_number.")
 
@@ -382,16 +478,6 @@ def _require_env(name: str) -> str:
     return value
 
 
-def _positive_int(raw: str, name: str) -> int:
-    try:
-        value = int(str(raw).strip())
-    except ValueError as exc:
-        raise SystemExit(f"{name} must be a positive integer") from exc
-    if value <= 0:
-        raise SystemExit(f"{name} must be a positive integer")
-    return value
-
-
 def _read_optional(path: Path) -> str:
     if not path.is_file():
         return ""
@@ -399,24 +485,16 @@ def _read_optional(path: Path) -> str:
 
 
 def _read_exit(path: Path) -> int:
-    raw = _read_optional(path).strip()
-    if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
-        return int(raw)
-    return 0
-
-
-def _read_json_object(path: Path) -> dict[str, Any]:
     try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"Could not read {path.name}: {exc}") from exc
-    if not isinstance(loaded, dict):
-        raise SystemExit(f"Could not read {path.name}: expected a JSON object")
-    return loaded
-
-
-def _truthy(value: str) -> bool:
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        raise ArtifactError(f"could not read {path.name}: {exc}") from exc
+    if not raw.isdigit():
+        raise ArtifactError(f"{path.name} must contain a numeric process exit code")
+    value = int(raw)
+    if value > 255:
+        raise ArtifactError(f"{path.name} contains an invalid process exit code: {value}")
+    return value
 
 
 def _maybe_str(value: object) -> str | None:

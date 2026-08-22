@@ -177,20 +177,16 @@ def truncate_diff(diff: str, max_diff_kb: int) -> Truncation:
 
 
 def _cut_diff_at_boundary(data: bytes, limit: int) -> bytes:
+    """Prefer a file/hunk boundary cut, but never discard most of the byte budget."""
     prefix = data[:limit]
-    boundaries: list[int] = []
-    for marker in (b"\ndiff --git ", b"\n@@ "):
-        start = 0
-        while True:
-            found = prefix.find(marker, start)
-            if found < 0:
-                break
-            boundaries.append(found + 1)
-            start = found + len(marker)
-    if boundaries:
-        return data[: max(boundaries)]
+    minimum = limit // 2
+    boundary = max(prefix.rfind(b"\ndiff --git "), prefix.rfind(b"\n@@ "))
+    if boundary + 1 > minimum:
+        return prefix[: boundary + 1]
     newline = prefix.rfind(b"\n")
-    return prefix[: newline + 1] if newline >= 0 else b""
+    if newline + 1 > minimum:
+        return prefix[: newline + 1]
+    return prefix
 
 
 def fetch_scoped_diff(
@@ -228,6 +224,8 @@ def collect_review_material(
     pr = github.pr_view(pr_number)
     head_from_pr = normalize_sha(_as_str(pr.get("headRefOid")))
     full_pr = request.scope == "full-pr"
+    if full_pr and head_from_pr is None:
+        raise GhError("PR head SHA is missing from the PR metadata; retry the review")
     plan = plan_diff(
         DiffRequest(
             scope=request.scope,
@@ -240,7 +238,9 @@ def collect_review_material(
     if full_pr:
         confirmed_pr = github.pr_view(pr_number)
         confirmed_head = normalize_sha(_as_str(confirmed_pr.get("headRefOid")))
-        if not confirmed_head or confirmed_head != plan.to_sha:
+        if confirmed_head is None:
+            raise GhError("PR head SHA is missing from the PR metadata; retry the review")
+        if confirmed_head != plan.to_sha:
             raise GhError("PR head changed while collecting the full-PR diff; retry the review")
         pr = confirmed_pr
     return CollectedReview(pr=pr, plan=plan, truncation=truncate_diff(raw, max_diff_kb))

@@ -217,6 +217,50 @@ def test_truncate_diff_stops_at_a_file_boundary() -> None:
     assert result.text == first
 
 
+def test_truncate_diff_never_discards_most_of_the_budget() -> None:
+    huge_single_hunk = "diff --git a/big.py b/big.py\n@@ -1,1 +1,3000 @@\n" + ("+padding\n" * 3000)
+    result = truncate_diff(huge_single_hunk, max_diff_kb=1)
+    assert result.truncated is True
+    assert result.embedded_bytes <= 1024
+    assert result.embedded_bytes > 512
+    assert "big.py" in result.text
+
+
+def test_full_pr_fails_with_accurate_error_when_head_is_missing() -> None:
+    class MissingHead(FakeGitHub):
+        def pr_view(self, number: int) -> dict[str, object]:
+            self.calls.append(("pr_view", number))
+            return {"number": number}
+
+    with pytest.raises(GhError, match="head SHA is missing"):
+        collect_review_material(
+            pr_number=7,
+            request=DiffRequest(scope="full-pr", before_sha=None, after_sha=None, head_sha=AFTER),
+            max_diff_kb=300,
+            github=MissingHead(),
+        )
+
+    class HeadVanishes(FakeGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.views = 0
+
+        def pr_view(self, number: int) -> dict[str, object]:
+            self.views += 1
+            self.calls.append(("pr_view", number))
+            if self.views == 1:
+                return {"number": number, "headRefOid": AFTER}
+            return {"number": number}
+
+    with pytest.raises(GhError, match="head SHA is missing"):
+        collect_review_material(
+            pr_number=7,
+            request=DiffRequest(scope="full-pr", before_sha=None, after_sha=None, head_sha=AFTER),
+            max_diff_kb=300,
+            github=HeadVanishes(),
+        )
+
+
 def test_full_pr_fails_if_head_changes_during_collection() -> None:
     class MovingHead(FakeGitHub):
         def __init__(self) -> None:

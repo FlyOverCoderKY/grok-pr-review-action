@@ -1,0 +1,227 @@
+"""Versioned serialization for files shared by composite-action commands."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, cast
+
+from grok_pr_review.scope import (
+    CollectedReview,
+    DiffKind,
+    DiffPlan,
+    Truncation,
+    normalize_sha,
+    parse_scope,
+)
+
+SCHEMA_VERSION = 1
+_DIFF_KINDS = {"full-pr", "commit-range", "single-commit"}
+
+
+class ArtifactError(ValueError):
+    """Raised when a persisted action artifact is missing or invalid."""
+
+
+@dataclass(frozen=True)
+class ReviewContext:
+    pr: dict[str, object]
+    plan: DiffPlan
+    truncated: bool
+    original_bytes: int
+    embedded_bytes: int
+    max_diff_kb: int
+
+    @classmethod
+    def from_collected(cls, collected: CollectedReview) -> ReviewContext:
+        truncation = collected.truncation
+        return cls(
+            pr=collected.pr,
+            plan=collected.plan,
+            truncated=truncation.truncated,
+            original_bytes=truncation.original_bytes,
+            embedded_bytes=truncation.embedded_bytes,
+            max_diff_kb=truncation.max_diff_kb,
+        )
+
+    @classmethod
+    def from_dict(cls, value: object) -> ReviewContext:
+        data = _object(value, "review context")
+        version = data.get("schema_version")
+        if version != SCHEMA_VERSION:
+            raise ArtifactError(
+                f"unsupported review context schema_version {version!r}; expected {SCHEMA_VERSION}"
+            )
+
+        pr = _object(data.get("pr"), "review context pr")
+        number = pr.get("number")
+        if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
+            raise ArtifactError("review context pr.number must be a positive integer")
+        pr_head = _full_sha(pr.get("headRefOid"), "review context pr.headRefOid")
+        pr["headRefOid"] = pr_head
+
+        plan_data = _object(data.get("plan"), "review context plan")
+        try:
+            scope = parse_scope(_string(plan_data.get("scope"), "plan.scope"))
+        except ValueError as exc:
+            raise ArtifactError(str(exc)) from exc
+        kind_value = _string(plan_data.get("kind"), "plan.kind")
+        if kind_value not in _DIFF_KINDS:
+            raise ArtifactError("plan.kind must be full-pr, commit-range, or single-commit")
+        kind = cast(DiffKind, kind_value)
+        from_sha = _optional_full_sha(plan_data.get("from_sha"), "plan.from_sha")
+        to_sha = _full_sha(plan_data.get("to_sha"), "plan.to_sha")
+        fallback_notice = _optional_string(plan_data.get("fallback_notice"), "plan.fallback_notice")
+        if kind == "commit-range" and from_sha is None:
+            raise ArtifactError("commit-range plan requires plan.from_sha")
+        if kind != "commit-range" and from_sha is not None:
+            raise ArtifactError(f"{kind} plan must not contain plan.from_sha")
+        if scope == "full-pr" and kind != "full-pr":
+            raise ArtifactError("full-pr scope requires full-pr plan.kind")
+        if scope == "latest-commit" and kind == "full-pr":
+            raise ArtifactError("latest-commit scope cannot contain full-pr plan.kind")
+        if to_sha != pr_head:
+            raise ArtifactError("plan.to_sha must match pr.headRefOid")
+
+        truncation = _object(data.get("truncation"), "review context truncation")
+        truncated = truncation.get("truncated")
+        if not isinstance(truncated, bool):
+            raise ArtifactError("truncation.truncated must be a boolean")
+        original_bytes = _nonnegative_int(truncation.get("original_bytes"), "original_bytes")
+        embedded_bytes = _nonnegative_int(truncation.get("embedded_bytes"), "embedded_bytes")
+        max_diff_kb = _positive_int(truncation.get("max_diff_kb"), "max_diff_kb")
+        if embedded_bytes > original_bytes:
+            raise ArtifactError("truncation.embedded_bytes cannot exceed original_bytes")
+        if embedded_bytes > max_diff_kb * 1024:
+            raise ArtifactError("truncation.embedded_bytes exceeds max_diff_kb")
+        if truncated and embedded_bytes >= original_bytes:
+            raise ArtifactError("truncated context must omit at least one byte")
+        if not truncated and embedded_bytes != original_bytes:
+            raise ArtifactError("untruncated context must preserve every byte")
+
+        return cls(
+            pr=pr,
+            plan=DiffPlan(
+                scope=scope,
+                kind=kind,
+                from_sha=from_sha,
+                to_sha=to_sha,
+                fallback_notice=fallback_notice,
+            ),
+            truncated=truncated,
+            original_bytes=original_bytes,
+            embedded_bytes=embedded_bytes,
+            max_diff_kb=max_diff_kb,
+        )
+
+    @classmethod
+    def read(cls, path: Path) -> ReviewContext:
+        try:
+            value: Any = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ArtifactError(f"could not read {path.name}: {exc}") from exc
+        except json.JSONDecodeError as exc:
+            raise ArtifactError(f"could not parse {path.name}: {exc}") from exc
+        return cls.from_dict(value)
+
+    def write(self, path: Path) -> None:
+        validated = self.from_dict(self.to_dict())
+        try:
+            serialized = json.dumps(validated.to_dict(), indent=2)
+            path.write_text(serialized, encoding="utf-8")
+        except (OSError, TypeError) as exc:
+            raise ArtifactError(f"could not write {path.name}: {exc}") from exc
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "pr": self.pr,
+            "plan": {
+                "scope": self.plan.scope,
+                "kind": self.plan.kind,
+                "from_sha": self.plan.from_sha,
+                "to_sha": self.plan.to_sha,
+                "fallback_notice": self.plan.fallback_notice,
+            },
+            "truncation": {
+                "truncated": self.truncated,
+                "original_bytes": self.original_bytes,
+                "embedded_bytes": self.embedded_bytes,
+                "max_diff_kb": self.max_diff_kb,
+            },
+        }
+
+    def to_collected(self, diff: str) -> CollectedReview:
+        actual_bytes = len(diff.encode("utf-8"))
+        if actual_bytes != self.embedded_bytes:
+            raise ArtifactError(
+                "diff.patch byte count does not match review-context.json "
+                f"({actual_bytes} != {self.embedded_bytes})"
+            )
+        return CollectedReview(
+            pr=self.pr,
+            plan=self.plan,
+            truncation=Truncation(
+                text=diff,
+                truncated=self.truncated,
+                original_bytes=self.original_bytes,
+                embedded_bytes=self.embedded_bytes,
+                max_diff_kb=self.max_diff_kb,
+            ),
+        )
+
+    @property
+    def truncation_notice(self) -> str | None:
+        return Truncation(
+            text="",
+            truncated=self.truncated,
+            original_bytes=self.original_bytes,
+            embedded_bytes=self.embedded_bytes,
+            max_diff_kb=self.max_diff_kb,
+        ).notice
+
+
+def _object(value: object, name: str) -> dict[str, object]:
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise ArtifactError(f"{name} must be a JSON object")
+    return cast(dict[str, object], dict(value))
+
+
+def _string(value: object, name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ArtifactError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
+def _optional_string(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    return _string(value, name)
+
+
+def _full_sha(value: object, name: str) -> str:
+    if not isinstance(value, str):
+        raise ArtifactError(f"{name} must be a full commit SHA")
+    normalized = normalize_sha(value)
+    if normalized is None or len(normalized) != 40:
+        raise ArtifactError(f"{name} must be a full commit SHA")
+    return normalized
+
+
+def _optional_full_sha(value: object, name: str) -> str | None:
+    if value is None:
+        return None
+    return _full_sha(value, name)
+
+
+def _nonnegative_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ArtifactError(f"truncation.{name} must be a nonnegative integer")
+    return value
+
+
+def _positive_int(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ArtifactError(f"truncation.{name} must be a positive integer")
+    return value
