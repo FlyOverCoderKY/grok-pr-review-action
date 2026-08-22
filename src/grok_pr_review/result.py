@@ -17,6 +17,11 @@ MAX_SUMMARY_LENGTH = 8_000
 MAX_TITLE_LENGTH = 300
 MAX_DETAIL_LENGTH = 8_000
 MAX_PATH_LENGTH = 1_000
+MAX_REVIEW_BODY_BYTES = 60_000
+
+_BODY_TRUNCATION_NOTICE = (
+    "\n\n> [!WARNING]\n> Some finding detail was omitted to stay within GitHub's review body limit."
+)
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
@@ -197,7 +202,8 @@ def format_review_body(result: ReviewResult, *, scope: str, model: str, run_url:
                 f"`{neutralize_mentions(location)}`"
             )
             lines.append(f"  {neutralize_mentions(issue.detail)}")
-    return "\n".join(lines).rstrip() + "\n"
+    body = "\n".join(lines).rstrip() + "\n"
+    return _limit_review_body(body)
 
 
 def format_incomplete_comment(result: ReviewResult, *, scope: str, model: str, run_url: str) -> str:
@@ -393,6 +399,19 @@ def _valid_review_path(value: str) -> bool:
         return False
     parsed = PurePosixPath(path)
     return not parsed.is_absolute() and all(part not in {"", ".", ".."} for part in parsed.parts)
+
+
+def _limit_review_body(body: str) -> str:
+    encoded = body.encode("utf-8")
+    if len(encoded) <= MAX_REVIEW_BODY_BYTES:
+        return body
+
+    suffix = (_BODY_TRUNCATION_NOTICE + "\n").encode("utf-8")
+    prefix = encoded[: MAX_REVIEW_BODY_BYTES - len(suffix)].decode("utf-8", errors="ignore")
+    last_newline = prefix.rfind("\n")
+    if last_newline >= max(0, len(prefix) - 2_000):
+        prefix = prefix[:last_newline]
+    return prefix.rstrip() + suffix.decode("utf-8")
 
 
 def neutralize_mentions(value: str) -> str:

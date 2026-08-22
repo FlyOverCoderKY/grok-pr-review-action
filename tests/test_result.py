@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 
 from grok_pr_review.result import (
+    MAX_REVIEW_BODY_BYTES,
+    Issue,
     ReviewResult,
     format_incomplete_comment,
     format_review_body,
@@ -165,3 +167,35 @@ def test_partial_review_is_visible_and_neutralizes_mentions() -> None:
     assert "[!WARNING]" in body
     assert "@\u200bmaintainers" in body
     assert "@\u200bsecurity" in body
+
+
+def test_review_body_is_capped_by_aggregate_utf8_size() -> None:
+    result = ReviewResult(
+        verdict="issues",
+        summary="🔍" * 8_000,
+        issues=[
+            Issue(
+                severity="risk",
+                path=f"src/file_{index}.py",
+                line=index + 1,
+                title=f"Finding {index}",
+                detail="x" * 8_000,
+            )
+            for index in range(8)
+        ],
+        stop_reason="EndTurn",
+    )
+
+    body = format_review_body(result, scope="full-pr", model="grok-4.6", run_url="")
+
+    assert len(body.encode("utf-8")) <= MAX_REVIEW_BODY_BYTES
+    assert "Some finding detail was omitted" in body
+
+
+def test_review_body_limit_does_not_change_normal_reviews() -> None:
+    result = ReviewResult(verdict="clean", summary="Looks good.", stop_reason="EndTurn")
+
+    body = format_review_body(result, scope="full-pr", model="grok-4.6", run_url="")
+
+    assert "Looks good." in body
+    assert "Some finding detail was omitted" not in body
