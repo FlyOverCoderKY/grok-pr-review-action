@@ -72,6 +72,7 @@ def test_readme_explains_latest_commit_and_auth() -> None:
 def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     assert text.index("## Unreleased") < text.index("## [1.0.0] - 2026-08-22")
+    assert "tagged and smoke-tested" in text
     assert "coverage manifest" in text
     assert "severity_schedule" in text
     assert "bot_login" in text

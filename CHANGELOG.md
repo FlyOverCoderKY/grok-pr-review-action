@@ -6,7 +6,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## [1.0.0] - 2026-08-22
 
-First stable release. Immutable `v1.0.0` is tagged after smoke; the movable `v1` alias follows (see [RELEASING.md](RELEASING.md)).
+First stable release. Immutable `v1.0.0` is tagged and smoke-tested before the movable `v1` alias follows (see [RELEASING.md](RELEASING.md)).
 
 ### Added
 
