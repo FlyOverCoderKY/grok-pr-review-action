@@ -104,6 +104,76 @@ jobs:
 
 `@v1` is the intended consumer pin. Until the movable `v1` alias exists, pin the immutable `v1.0.0` tag (`FlyOverCoderKY/grok-pr-review-action@v1.0.0`) or a commit SHA. [RELEASING.md](RELEASING.md) tags immutable `v1.0.0` first, smoke-tests that tag, then moves `v1`.
 
+The example above is a single job with two steps. Org reusable callers with agent hot-push loops should use the [Recommended caller concurrency](#recommended-caller-concurrency) recipe so a `synchronize` run cannot cancel the opening `full-pr` review.
+
+## Recommended caller concurrency
+
+This action runs **one review per invocation**. It does not implement workflow concurrency or merge gating. Those belong in the org reusable caller (for example RetireGolden/.github, and later pegma-dev/.github) that wraps this action.
+
+A single PR-wide `concurrency` group with `cancel-in-progress: true` treats `opened` and `synchronize` as the same run. The first agent push then cancels the in-progress first pass — you lose the opening review and still pay for the cancelled tokens. A follow-up that starts before that first pass has posted also fails closed: `latest-commit` verify needs the prior ledger.
+
+### Recipe
+
+Use **separate first-pass and follow-up jobs**, or distinct **job-level / two-suffix concurrency groups**, so the two passes cannot cancel each other.
+
+| Pass | Events | `review_scope` | Cancel-in-progress |
+| --- | --- | --- | --- |
+| First-pass | `opened`, `reopened`, `ready_for_review`, `workflow_dispatch` | `full-pr` | Never from `synchronize`. Rapid first-passes may cancel each other. |
+| Follow-up | `synchronize` | `latest-commit` | OK among follow-ups only. Start only after first-pass has completed. |
+
+Do **not** put first-pass and follow-up in one concurrency group that `synchronize` can cancel.
+
+A two-suffix workflow-level group is enough when the reusable workflow only runs this review:
+
+```yaml
+# Same PR, two groups: synchronize must not cancel an in-progress first-pass.
+concurrency:
+  group: grok-review-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}-${{ github.event.action == 'synchronize' && 'follow-up' || 'first-pass' }}
+  cancel-in-progress: true
+```
+
+Job-level groups are better when the workflow has other jobs you do not want cancelled with a superseded follow-up:
+
+```yaml
+jobs:
+  grok-first-pass:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.action == 'opened' ||
+      github.event.action == 'reopened' ||
+      github.event.action == 'ready_for_review'
+    concurrency:
+      group: grok-first-pass-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: true
+    steps:
+      # checkout, then:
+      - uses: FlyOverCoderKY/grok-pr-review-action@v1
+        with:
+          review_scope: full-pr
+          # ...
+
+  grok-follow-up:
+    if: github.event.action == 'synchronize'
+    concurrency:
+      group: grok-follow-up-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: true
+    steps:
+      # Wait until grok-first-pass (or its check) succeeded for this PR.
+      # Do not use needs: grok-first-pass — that job is skipped on synchronize.
+      - uses: FlyOverCoderKY/grok-pr-review-action@v1
+        with:
+          review_scope: latest-commit
+          # ...
+```
+
+### Follow-up waits for first-pass
+
+A `synchronize` job should not invoke this action until the first-pass job (or its check) has a successful conclusion for the PR. `latest-commit` verify without a published ledger fails closed instead of silently resetting to round 1.
+
+### Optional merge gate
+
+If branch protection needs a required check, publish a dedicated first-pass status (for example `grok-first-pass`) and require that. Keep it green only after first-pass has landed. Do not require the follow-up job: cancelled `synchronize` runs would fail the gate even when the opening review succeeded.
+
 ## Inputs
 
 | Input | Default | Notes |
@@ -156,7 +226,7 @@ The action is built for an agentic PR loop: review → agent fixes → re-review
 
 **Rounds 2+ (verify, on `synchronize`)** are convergence rounds. Under `latest-commit` scope the verification diff spans everything **since the last published review** (from the SHA recorded in the ledger to the current head), not just this push's webhook range — so concurrent pushes completing out of order can never leave a commit range unreviewed. The bot reads its own prior review, re-lists the open findings, and asks Grok to verdict each one — `fixed`, `not_fixed`, `fixed_incorrectly`, or `disputed` — using the fix commits and the fixing agent's comment-thread replies as evidence. A reasoned rebuttal settles a finding as disputed; it is never re-raised without new evidence. New findings are accepted only in code the fix commits touched, at or above the round's severity floor from `severity_schedule` — so by round 3 (default) a nit about comment phrasing is structurally unreportable. A verify push changing more than `verify_escalation_lines` lines — or one whose diff exceeded `max_diff_kb` and was truncated — escalates to a full-severity review automatically, because a massive mid-loop change means the loop is off the rails. When the floor rises, still-open lower-severity findings from earlier rounds are retired without a disposition — by design: by round 3 an unfixed nit is noise, not signal — so "open findings" means unresolved findings at or above the current floor.
 
-State lives in a hidden, base64-encoded ledger inside the bot's own review bodies — the fixing agent needs no bot-specific protocol, so this action coexists with other review bots. The ledger is **only trusted from reviews authored by `bot_login`** (default `github-actions[bot]`) and is bound to the repository, PR, and reviewed commit, so other reviewers cannot forge loop state. If `github_token` posts as a different login and `bot_login` is left at the default, prior rounds are invisible: continuity is lost and disposition tracking breaks (see [`bot_login` and ledger continuity](#bot_login-and-ledger-continuity)). State recovery fails closed: if prior reviews cannot be read, if the newest ledger marker is corrupted, or if a `latest-commit` synchronize run finds no prior state at all, the run fails visibly instead of silently resetting to round 1 and discarding carried findings — only an explicit `review_mode: initial` with `review_scope: full-pr` (or a state-free `full-pr` collection) starts fresh. The ledger preserves every open finding or fails the run: settled disputed findings may be trimmed to fit the marker's size limits, but unresolved findings are never silently dropped. Any partial run — including a stale, truncated, or history-fallback review — posts its findings and warning but never publishes ledger state; the previous complete marker remains the retry boundary. Dispositions come only from commits and ordinary GitHub comment replies. New findings in every round are validated against the embedded diff's paths. `issue_count`/`bug_count` outputs report **open** findings including unfixed carry-overs, so an agent loop should iterate until `bug_count` is `0` (or `issue_count`, if it chases risks too). Use `verify_model`/`verify_effort` to run verify rounds on a cheaper tier when you want that trade — verifying a fix is a much easier task than finding the issue was. Setting `verify_model` different from `model` is supported, but it is an intentional xAI prompt-cache miss on verify rounds (different model = no shared cache with the initial pass). Keep both on the same model (for example `grok-4.6`) unless you consciously want a cheaper verify tier over cache reuse. The posted review is labeled with the model that actually ran. Forcing `review_mode: initial` with `review_scope: full-pr` (or any `workflow_dispatch` run using that scope) resets the loop with a fresh exhaustive review. Add a `concurrency` group with `cancel-in-progress: true` to avoid paying for superseded runs.
+State lives in a hidden, base64-encoded ledger inside the bot's own review bodies — the fixing agent needs no bot-specific protocol, so this action coexists with other review bots. The ledger is **only trusted from reviews authored by `bot_login`** (default `github-actions[bot]`) and is bound to the repository, PR, and reviewed commit, so other reviewers cannot forge loop state. If `github_token` posts as a different login and `bot_login` is left at the default, prior rounds are invisible: continuity is lost and disposition tracking breaks (see [`bot_login` and ledger continuity](#bot_login-and-ledger-continuity)). State recovery fails closed: if prior reviews cannot be read, if the newest ledger marker is corrupted, or if a `latest-commit` synchronize run finds no prior state at all, the run fails visibly instead of silently resetting to round 1 and discarding carried findings — only an explicit `review_mode: initial` with `review_scope: full-pr` (or a state-free `full-pr` collection) starts fresh. The ledger preserves every open finding or fails the run: settled disputed findings may be trimmed to fit the marker's size limits, but unresolved findings are never silently dropped. Any partial run — including a stale, truncated, or history-fallback review — posts its findings and warning but never publishes ledger state; the previous complete marker remains the retry boundary. Dispositions come only from commits and ordinary GitHub comment replies. New findings in every round are validated against the embedded diff's paths. `issue_count`/`bug_count` outputs report **open** findings including unfixed carry-overs, so an agent loop should iterate until `bug_count` is `0` (or `issue_count`, if it chases risks too). Use `verify_model`/`verify_effort` to run verify rounds on a cheaper tier when you want that trade — verifying a fix is a much easier task than finding the issue was. Setting `verify_model` different from `model` is supported, but it is an intentional xAI prompt-cache miss on verify rounds (different model = no shared cache with the initial pass). Keep both on the same model (for example `grok-4.6`) unless you consciously want a cheaper verify tier over cache reuse. The posted review is labeled with the model that actually ran. Forcing `review_mode: initial` with `review_scope: full-pr` (or any `workflow_dispatch` run using that scope) resets the loop with a fresh exhaustive review. Caller concurrency belongs in the reusable workflow, not this action: isolate first-pass from `synchronize` so hot-push loops do not cancel the opening review. See [Recommended caller concurrency](#recommended-caller-concurrency).
 
 Grok runs headless with `--prompt-file` and JSON output. Tools are allowlisted to `read_file`, `grep`, and `list_dir`. There is no shell tool. `--yolo` only auto-approves those read-only tools.
 

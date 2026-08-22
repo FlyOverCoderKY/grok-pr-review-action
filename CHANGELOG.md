@@ -4,6 +4,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## Unreleased
 
+### Added
+
+- Document recommended caller concurrency: isolate first-pass (`full-pr` on `opened` / `reopened` / `ready_for_review` / `workflow_dispatch`) from synchronize follow-ups (`latest-commit`) so hot-push loops do not cancel the opening review or burn tokens on cancelled follow-ups. Optional merge gates should stay green only after first-pass landed. Concurrency and merge gating belong in the org reusable caller; this action still runs a single review.
+
 ### Fixed
 
 - Install `bubblewrap` (`bwrap`) on Linux before invoking the Grok CLI so GitHub-hosted Ubuntu runners can enforce the strict sandbox deny list. If `bwrap` is already present the install is skipped; if it cannot be installed the action still fails closed. Self-hosted Linux runners must provide `bwrap` or allow `sudo apt-get install -y bubblewrap`. There is no production switch to disable the sandbox.

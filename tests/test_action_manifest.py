@@ -91,6 +91,14 @@ def test_readme_explains_latest_commit_and_auth() -> None:
     assert "bwrap-userns-restrict" in text
     assert "Ubuntu 24.04" in text
     assert "does **not** disable `--sandbox strict`" in text
+    assert "## Recommended caller concurrency" in text
+    assert "one review per invocation" in text
+    assert "Never from `synchronize`" in text
+    assert "Start only after first-pass has completed" in text
+    assert "Do not require the follow-up job" in text
+    assert "org reusable caller" in text
+    stale = "cancel-in-progress: true` to avoid paying for superseded runs."
+    assert stale not in text
 
 
 def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
@@ -111,3 +119,5 @@ def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     assert "v1.0.3" in unreleased
     assert ".grok-pr-review/prompt.md" in unreleased
     assert "Permission denied (os error 13)" in unreleased
+    assert "recommended caller concurrency" in unreleased
+    assert "org reusable caller" in unreleased
