@@ -12,6 +12,91 @@ pin=$(bash "$repo_root/scripts/install-grok.sh" --print-pin aarch64)
 validator_pin=$(bash "$repo_root/scripts/install-action-validator.sh" --print-pin)
 [[ "$validator_pin" == "0.9.0 9f42f94fca5b8d04c13bccfbb331104b37a9250650d89ae58dc888d46206f9b9" ]]
 
+# Bubblewrap prep is tested with PATH stubs so unit/smoke does not need real apt.
+host_bash=$(command -v bash)
+host_uname=$(command -v uname)
+host_chmod=$(command -v chmod)
+restrict_path() {
+  local dir=$1
+  mkdir -p "$dir"
+  ln -s "$host_bash" "$dir/bash"
+  ln -s "$host_uname" "$dir/uname"
+  ln -s "$host_chmod" "$dir/chmod"
+}
+
+bwrap_present="$test_root/bwrap-present"
+restrict_path "$bwrap_present"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$bwrap_present/bwrap"
+chmod +x "$bwrap_present/bwrap"
+present_out=$(PATH="$bwrap_present" "$host_bash" "$repo_root/scripts/install-grok.sh" --ensure-bwrap)
+[[ "$present_out" == *"already available"* ]]
+
+bwrap_none="$test_root/bwrap-none"
+restrict_path "$bwrap_none"
+if PATH="$bwrap_none" "$host_bash" "$repo_root/scripts/install-grok.sh" --ensure-bwrap \
+  >"$test_root/bwrap-none.out" 2>"$test_root/bwrap-none.err"; then
+  echo "ensure-bwrap succeeded without apt-get or sudo" >&2
+  exit 1
+fi
+grep -q 'apt-get is not available' "$test_root/bwrap-none.err"
+
+bwrap_nosudo="$test_root/bwrap-nosudo"
+restrict_path "$bwrap_nosudo"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$bwrap_nosudo/apt-get"
+chmod +x "$bwrap_nosudo/apt-get"
+if PATH="$bwrap_nosudo" "$host_bash" "$repo_root/scripts/install-grok.sh" --ensure-bwrap \
+  >"$test_root/bwrap-nosudo.out" 2>"$test_root/bwrap-nosudo.err"; then
+  echo "ensure-bwrap succeeded without sudo" >&2
+  exit 1
+fi
+grep -q 'sudo is not available' "$test_root/bwrap-nosudo.err"
+
+bwrap_install="$test_root/bwrap-install"
+restrict_path "$bwrap_install"
+export SUDO_LOG="$test_root/sudo.log" APT_LOG="$test_root/apt.log" FAKE_BIN="$bwrap_install"
+cat > "$bwrap_install/sudo" <<'SUDO'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SUDO_LOG:?}"
+exec "$@"
+SUDO
+cat > "$bwrap_install/apt-get" <<'APT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${APT_LOG:?}"
+if [[ "${1:-}" == "install" ]]; then
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "${FAKE_BIN:?}/bwrap"
+  chmod +x "${FAKE_BIN}/bwrap"
+fi
+exit 0
+APT
+chmod +x "$bwrap_install/sudo" "$bwrap_install/apt-get"
+PATH="$bwrap_install" "$host_bash" "$repo_root/scripts/install-grok.sh" --ensure-bwrap
+[[ -x "$bwrap_install/bwrap" ]]
+grep -qx 'apt-get update' "$SUDO_LOG"
+grep -qx 'apt-get install -y bubblewrap' "$SUDO_LOG"
+grep -q 'update' "$APT_LOG"
+grep -q 'install -y bubblewrap' "$APT_LOG"
+
+bwrap_missing_after="$test_root/bwrap-missing-after"
+restrict_path "$bwrap_missing_after"
+export SUDO_LOG="$test_root/sudo-missing.log" APT_LOG="$test_root/apt-missing.log"
+cat > "$bwrap_missing_after/sudo" <<'SUDO'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SUDO_LOG:?}"
+exec "$@"
+SUDO
+cat > "$bwrap_missing_after/apt-get" <<'APT'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${APT_LOG:?}"
+exit 0
+APT
+chmod +x "$bwrap_missing_after/sudo" "$bwrap_missing_after/apt-get"
+if PATH="$bwrap_missing_after" "$host_bash" "$repo_root/scripts/install-grok.sh" --ensure-bwrap \
+  >"$test_root/bwrap-missing-after.out" 2>"$test_root/bwrap-missing-after.err"; then
+  echo "ensure-bwrap succeeded when apt-get did not provide bwrap" >&2
+  exit 1
+fi
+grep -q 'still not on PATH' "$test_root/bwrap-missing-after.err"
+
 stub="$test_root/grok"
 args_file="$test_root/args"
 cat > "$stub" <<'STUB'

@@ -35,6 +35,8 @@ The action writes `config.toml` under a job-specific temporary `GROK_HOME` that 
 
 The action downloads the pinned Grok CLI 1.0.5 binary for Linux x86-64 or arm64 and verifies its SHA-256 checksum before execution. Other operating systems fail with an explicit unsupported-runner error.
 
+Linux runners also need [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) so Grok can enforce its strict OS sandbox deny list. GitHub-hosted Ubuntu images do not currently ship `bwrap`. The action installs the `bubblewrap` package with `sudo apt-get update && sudo apt-get install -y bubblewrap` when `bwrap` is missing. Self-hosted Linux runners must either provide `bwrap` on `PATH` or allow that passwordless `apt-get` install. If `bwrap` cannot be installed, the action fails closed and does **not** disable the sandbox.
+
 ## Data sent to xAI
 
 This action uses the xAI API as an external processor. The prompt always sends PR metadata, the selected diff, and `custom_instructions` to xAI. When Grok uses `read_file`, `grep`, or `list_dir`, the relevant paths and repository content returned by those tools can also be sent to xAI as model context. Grok's response is then parsed locally and posted to GitHub as a PR review or issue comment.

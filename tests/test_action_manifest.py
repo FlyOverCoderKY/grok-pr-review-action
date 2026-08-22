@@ -37,10 +37,14 @@ def test_action_yml_uses_xai_api_key_not_supergrok() -> None:
     assert "scripts/run-grok.sh" in text
     assert "scripts/cleanup-workdir.sh" in text
     assert "--sandbox strict" in run_script
+    assert "--sandbox off" not in run_script
     assert "--no-subagents" in run_script
     assert "--disable-web-search" in run_script
     assert 'GROK_VERSION="1.0.5"' in install_script
     assert "sha256sum --check" in install_script
+    assert "ensure_bubblewrap" in install_script
+    assert "apt-get install -y bubblewrap" in install_script
+    assert "--ensure-bwrap" in install_script
     assert 'rm -rf -- "$work"' in cleanup_script
     assert 'rm -f "$HOME/.grok/' not in text
     assert 'rm -rf "$HOME/.grok' not in text
@@ -67,6 +71,10 @@ def test_readme_explains_latest_commit_and_auth() -> None:
     assert "prompt-cache miss" in text
     assert "uses: FlyOverCoderKY/grok-pr-review-action@v1" in text
     assert "@v1.0.0" in text
+    assert "bubblewrap" in text
+    assert "`bwrap`" in text
+    assert "Self-hosted Linux runners" in text
+    assert "does **not** disable the sandbox" in text
 
 
 def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
@@ -79,3 +87,4 @@ def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     assert "fixed_incorrectly" in text
     assert "verify_model" in text
     assert "review_mode" in text
+    assert "bubblewrap" in text.split("## [1.0.0]", 1)[0]
