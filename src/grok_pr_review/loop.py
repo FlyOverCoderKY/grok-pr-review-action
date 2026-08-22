@@ -57,6 +57,7 @@ class LedgerFinding:
 class Ledger:
     round_number: int
     findings: tuple[LedgerFinding, ...]
+    reviewed_sha: str = ""
 
 
 @dataclass(frozen=True)
@@ -83,7 +84,6 @@ class LoopState:
 class RoundOutcome:
     ledger: Ledger
     result: ReviewResult
-    hidden_marker: str
     extra_lines: list[str]
     open_issue_count: int
     open_bug_count: int
@@ -98,10 +98,11 @@ def decide_loop_state(
     """Return (mode, round_number). An initial review always resets the loop."""
     if review_mode == "initial" or ledger is None:
         return "initial", 1
+    next_round = min(ledger.round_number + 1, MAX_ROUNDS_TRACKED)
     if review_mode == "verify":
-        return "verify", ledger.round_number + 1
+        return "verify", next_round
     if event_action.strip().lower() == "synchronize":
-        return "verify", ledger.round_number + 1
+        return "verify", next_round
     return "initial", 1
 
 
@@ -221,28 +222,48 @@ def apply_round(state: LoopState, result: ReviewResult) -> RoundOutcome:
     return RoundOutcome(
         ledger=ledger,
         result=updated,
-        hidden_marker=encode_ledger(ledger),
         extra_lines=extra_lines,
         open_issue_count=len(open_findings),
         open_bug_count=open_bug_count,
     )
 
 
-def encode_ledger(ledger: Ledger) -> str:
-    findings = list(ledger.findings)
-    encoded = _encode(ledger.round_number, findings)
-    if len(encoded) > MAX_LEDGER_BYTES:
-        findings = [replace(finding, title=finding.title[:80]) for finding in findings]
-        encoded = _encode(ledger.round_number, findings)
-    if len(encoded) > MAX_LEDGER_BYTES:
-        findings = [finding for finding in findings if finding.status == "open"]
-        encoded = _encode(ledger.round_number, findings)
+def encode_ledger(ledger: Ledger, *, repo: str, pr_number: int) -> str:
+    """Encode a marker bound to this repo/PR that is guaranteed to decode.
+
+    Findings are kept in priority order (open bugs, open risks, open nits,
+    then disputed) and trimmed deterministically to both the finding-count
+    and byte limits, so a valid next-round load can never be bricked by an
+    oversized or over-full marker.
+    """
+    findings = _trim_findings(list(ledger.findings))
+    while True:
+        encoded = _encode(ledger, findings, repo=repo, pr_number=pr_number)
+        if len(encoded) <= MAX_LEDGER_BYTES or not findings:
+            break
+        findings = findings[:-1]
+    token = encoded[len(LEDGER_PREFIX) : -len(LEDGER_SUFFIX)]
+    if _decode(token, repo=repo, pr_number=pr_number) is None:
+        encoded = _encode(ledger, [], repo=repo, pr_number=pr_number)
     return encoded
 
 
-def _encode(round_number: int, findings: list[LedgerFinding]) -> str:
+def _trim_findings(findings: list[LedgerFinding]) -> list[LedgerFinding]:
+    def priority(finding: LedgerFinding) -> tuple[int, int]:
+        status_rank = 0 if finding.status == "open" else 1
+        return (status_rank, -SEVERITY_RANK.get(finding.severity, 0))
+
+    ordered = sorted(findings, key=priority)
+    clipped = [replace(finding, title=finding.title[:80].strip() or "…") for finding in ordered]
+    return clipped[:MAX_LEDGER_FINDINGS]
+
+
+def _encode(ledger: Ledger, findings: list[LedgerFinding], *, repo: str, pr_number: int) -> str:
     payload = {
-        "round": round_number,
+        "repo": repo,
+        "pr": pr_number,
+        "sha": ledger.reviewed_sha,
+        "round": ledger.round_number,
         "findings": [
             {
                 "id": finding.id,
@@ -260,29 +281,38 @@ def _encode(round_number: int, findings: list[LedgerFinding]) -> str:
     return f"{LEDGER_PREFIX}{token}{LEDGER_SUFFIX}"
 
 
-def extract_ledger(body: str) -> Ledger | None:
-    """Decode the newest valid ledger marker in one review body, else None."""
+def has_ledger_marker(body: str) -> bool:
+    return LEDGER_PREFIX in body
+
+
+def extract_ledger(body: str, *, repo: str, pr_number: int) -> Ledger | None:
+    """Decode the newest valid ledger marker bound to this repo/PR, else None."""
     for match in reversed(list(_LEDGER_RE.finditer(body))):
-        ledger = _decode(match.group(1))
+        ledger = _decode(match.group(1), repo=repo, pr_number=pr_number)
         if ledger is not None:
             return ledger
     return None
 
 
-def latest_ledger(bodies: list[str]) -> Ledger | None:
+def latest_ledger(bodies: list[str], *, repo: str, pr_number: int) -> Ledger | None:
     for body in reversed(bodies):
-        ledger = extract_ledger(body)
+        ledger = extract_ledger(body, repo=repo, pr_number=pr_number)
         if ledger is not None:
             return ledger
     return None
 
 
-def _decode(token: str) -> Ledger | None:
+def _decode(token: str, *, repo: str, pr_number: int) -> Ledger | None:
     try:
         payload = json.loads(base64.b64decode(token, validate=True).decode("utf-8"))
     except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(payload, dict):
+        return None
+    if payload.get("repo") != repo or payload.get("pr") != pr_number:
+        return None
+    sha = payload.get("sha")
+    if not isinstance(sha, str) or (sha != "" and not re.fullmatch(r"[0-9a-f]{40}", sha)):
         return None
     round_number = payload.get("round")
     raw_findings = payload.get("findings")
@@ -300,7 +330,7 @@ def _decode(token: str) -> Ledger | None:
         if finding is None:
             return None
         findings.append(finding)
-    return Ledger(round_number=round_number, findings=tuple(findings))
+    return Ledger(round_number=round_number, findings=tuple(findings), reviewed_sha=sha)
 
 
 def _decode_finding(item: object) -> LedgerFinding | None:

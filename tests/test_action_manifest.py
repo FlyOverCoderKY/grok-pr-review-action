@@ -29,6 +29,7 @@ def test_action_yml_uses_xai_api_key_not_supergrok() -> None:
     assert "severity_schedule" in text
     assert "verify_model" in text
     assert "verify_escalation_lines" in text
+    assert "bot_login" in text
     assert "model-override" in text
     assert "steps.finish.outputs.round" in text
     assert "prepare-workspace" in text

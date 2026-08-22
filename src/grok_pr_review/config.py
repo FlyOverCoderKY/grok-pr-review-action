@@ -15,6 +15,7 @@ RoastLevel = Literal["professional", "playful", "savage", "diabolical"]
 ReviewMode = Literal["auto", "initial", "verify"]
 Severity = Literal["nit", "risk", "bug"]
 
+DEFAULT_BOT_LOGIN = "github-actions[bot]"
 DEFAULT_MODEL = "grok-4.6"
 DEFAULT_GITHUB_TIMEOUT_SECONDS = 120
 DEFAULT_SEVERITY_SCHEDULE = "nit,risk,bug"
@@ -57,6 +58,7 @@ class ActionConfig:
     verify_model: str
     verify_effort: Effort
     verify_escalation_lines: int
+    bot_login: str
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> ActionConfig:
@@ -110,7 +112,15 @@ class ActionConfig:
                 minimum=1,
                 maximum=MAX_VERIFY_ESCALATION_LINES,
             ),
+            bot_login=parse_bot_login(env.get("BOT_LOGIN", DEFAULT_BOT_LOGIN)),
         )
+
+
+def parse_bot_login(value: str) -> str:
+    chosen = value.strip() or DEFAULT_BOT_LOGIN
+    if len(chosen) > 100 or any(character.isspace() for character in chosen):
+        raise ConfigError("bot_login must be a GitHub login of at most 100 characters")
+    return chosen
 
 
 def parse_model(value: str) -> str:

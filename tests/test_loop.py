@@ -39,20 +39,23 @@ def test_ledger_round_trips_through_the_hidden_marker() -> None:
         round_number=2,
         findings=(_finding("r1-1"), _finding("r1-2", "nit", "disputed", "Comment tone")),
     )
-    marker = encode_ledger(ledger)
+    marker = encode_ledger(ledger, repo="owner/repo", pr_number=7)
     assert marker.startswith("<!-- grok-review-ledger:v1:")
     body = f"## Grok PR review\n{marker}\n\nLooks good."
-    decoded = extract_ledger(body)
+    decoded = extract_ledger(body, repo="owner/repo", pr_number=7)
     assert decoded == ledger
+    assert extract_ledger(body, repo="other/repo", pr_number=7) is None
+    assert extract_ledger(body, repo="owner/repo", pr_number=8) is None
 
 
 def test_malformed_or_absent_ledgers_are_ignored() -> None:
-    assert extract_ledger("no marker here") is None
-    assert extract_ledger("<!-- grok-review-ledger:v1:!!!notbase64!!! -->") is None
-    good = encode_ledger(Ledger(1, (_finding("r1-1"),)))
-    later = encode_ledger(Ledger(3, (_finding("r1-1"),)))
-    assert latest_ledger(["irrelevant", good, "codex review body", later]) is not None
-    found = latest_ledger([good, later])
+    binding = {"repo": "owner/repo", "pr_number": 7}
+    assert extract_ledger("no marker here", **binding) is None
+    assert extract_ledger("<!-- grok-review-ledger:v1:!!!notbase64!!! -->", **binding) is None
+    good = encode_ledger(Ledger(1, (_finding("r1-1"),)), repo="owner/repo", pr_number=7)
+    later = encode_ledger(Ledger(3, (_finding("r1-1"),)), repo="owner/repo", pr_number=7)
+    assert latest_ledger(["irrelevant", good, "codex review body", later], **binding) is not None
+    found = latest_ledger([good, later], **binding)
     assert found is not None and found.round_number == 3
 
 
@@ -126,7 +129,8 @@ def test_apply_round_initial_assigns_ids_and_opens_the_ledger() -> None:
     assert outcome.open_bug_count == 1
     assert outcome.result.verdict == "issues"
     assert outcome.extra_lines == []
-    assert extract_ledger(outcome.hidden_marker) == outcome.ledger
+    marker = encode_ledger(outcome.ledger, repo="owner/repo", pr_number=7)
+    assert extract_ledger(marker, repo="owner/repo", pr_number=7) == outcome.ledger
 
 
 def test_apply_round_verify_resolves_carries_and_enforces_the_floor() -> None:
@@ -206,3 +210,34 @@ def test_render_agent_context_is_bounded_and_labeled() -> None:
     assert "…[clipped]" in text
     assert "PR comment (from nathan):" in text
     assert len(text.encode("utf-8")) <= 17_000
+
+
+def test_encode_ledger_trims_deterministically_and_always_decodes() -> None:
+    findings = tuple(
+        LedgerFinding(
+            id=f"r1-{index + 1}",
+            severity=("nit", "risk", "bug")[index % 3],
+            path="src/" + ("deep/" * 60) + f"file_{index}.py",
+            line=index + 1,
+            title="A very long finding title " * 10,
+            status="open" if index % 4 else "disputed",
+        )
+        for index in range(400)
+    )
+    marker = encode_ledger(Ledger(5, findings), repo="owner/repo", pr_number=7)
+    assert len(marker) <= 40_000 + 60
+    decoded = extract_ledger(marker, repo="owner/repo", pr_number=7)
+    assert decoded is not None
+    assert len(decoded.findings) <= 300
+    kept = decoded.findings
+    open_bugs_kept = sum(1 for f in kept if f.status == "open" and f.severity == "bug")
+    open_bugs_total = sum(1 for f in findings if f.status == "open" and f.severity == "bug")
+    assert open_bugs_kept == min(open_bugs_total, len(kept))
+
+
+def test_decide_loop_state_clamps_the_round_counter() -> None:
+    ledger = Ledger(999, (_finding("r1-1"),))
+    assert decide_loop_state(review_mode="verify", event_action="", ledger=ledger) == (
+        "verify",
+        999,
+    )

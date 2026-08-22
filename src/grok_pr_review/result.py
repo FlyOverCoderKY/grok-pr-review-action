@@ -14,6 +14,7 @@ Verdict = Literal["clean", "issues", "partial", "error"]
 MAX_TURNS_REASONS = {"max_turn", "max_turn_requests", "max_turns", "max_turns_reached"}
 SUCCESS_REASONS = {"end_turn"}
 MAX_ISSUES = 100
+MAX_COVERAGE_ENTRIES = 500
 MAX_RESOLUTIONS = 200
 MAX_SUMMARY_LENGTH = 8_000
 MAX_TITLE_LENGTH = 300
@@ -64,6 +65,7 @@ class ReviewResult:
     stop_reason: str | None = None
     partial_reason: str | None = None
     resolutions: list[Resolution] = field(default_factory=list)
+    coverage: list[tuple[str, int]] = field(default_factory=list)
 
     @property
     def issue_count(self) -> int:
@@ -110,10 +112,11 @@ def parse_grok_output(raw: str, *, exit_code: int = 0) -> ReviewResult:
     summary = ""
     issues: list[Issue] = []
     resolutions: list[Resolution] = []
+    coverage: list[tuple[str, int]] = []
     validation_error: str | None = None
     if findings is not None:
         try:
-            summary, issues, resolutions = _parse_findings(findings)
+            summary, issues, resolutions, coverage = _parse_findings(findings)
         except ValueError as exc:
             validation_error = str(exc)
 
@@ -176,6 +179,7 @@ def parse_grok_output(raw: str, *, exit_code: int = 0) -> ReviewResult:
         issues=issues,
         stop_reason=stop_reason,
         resolutions=resolutions,
+        coverage=coverage,
     )
 
 
@@ -455,7 +459,9 @@ def _looks_like_findings(data: dict[str, Any]) -> bool:
     return "issues" in data or "summary" in data
 
 
-def _parse_findings(findings: dict[str, Any]) -> tuple[str, list[Issue], list[Resolution]]:
+def _parse_findings(
+    findings: dict[str, Any],
+) -> tuple[str, list[Issue], list[Resolution], list[tuple[str, int]]]:
     summary_value = findings.get("summary")
     if not isinstance(summary_value, str) or not summary_value.strip():
         raise ValueError("summary must be a non-empty string")
@@ -507,7 +513,62 @@ def _parse_findings(findings: dict[str, Any]) -> tuple[str, list[Issue], list[Re
                 detail=detail.strip(),
             )
         )
-    return summary, issues, _parse_resolutions(findings)
+    return summary, issues, _parse_resolutions(findings), _parse_coverage(findings)
+
+
+def _parse_coverage(findings: dict[str, Any]) -> list[tuple[str, int]]:
+    raw = findings.get("coverage")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("coverage must be an array or absent")
+    if len(raw) > MAX_COVERAGE_ENTRIES:
+        raise ValueError(f"coverage exceeds the limit of {MAX_COVERAGE_ENTRIES}")
+    entries: list[tuple[str, int]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"coverage[{index}] must be an object")
+        path = item.get("path")
+        count = item.get("findings")
+        if not isinstance(path, str) or not _valid_review_path(path):
+            raise ValueError(f"coverage[{index}].path must be a safe relative path")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"coverage[{index}].findings must be a nonnegative integer")
+        normalized = path.strip()
+        if normalized in seen:
+            raise ValueError(f"coverage lists {normalized!r} more than once")
+        seen.add(normalized)
+        entries.append((normalized, count))
+    return entries
+
+
+def validate_coverage(result: ReviewResult, diff_paths: set[str]) -> str | None:
+    """Reject an initial review whose coverage manifest does not account for the diff."""
+    if not diff_paths:
+        return None
+    covered = dict(result.coverage)
+    if not covered:
+        return "coverage is missing; the manifest must account for every diff file"
+    missing = sorted(diff_paths - set(covered))
+    if missing:
+        named = ", ".join(missing[:5])
+        return f"coverage does not account for {len(missing)} diff file(s): {named}"
+    extra = sorted(set(covered) - diff_paths)
+    if extra:
+        named = ", ".join(extra[:5])
+        return f"coverage lists file(s) not in the embedded diff: {named}"
+    reported: dict[str, int] = {}
+    for issue in result.issues:
+        if issue.path:
+            reported[issue.path] = reported.get(issue.path, 0) + 1
+    for path, count in covered.items():
+        if reported.get(path, 0) != count:
+            return (
+                f"coverage claims {count} finding(s) in {path!r} but "
+                f"{reported.get(path, 0)} were reported"
+            )
+    return None
 
 
 def _parse_resolutions(findings: dict[str, Any]) -> list[Resolution]:

@@ -86,10 +86,18 @@ class GitHubCli:
                 return ident
         return None
 
-    def list_review_bodies(self, pr_number: int) -> list[str]:
-        """Every review body on the PR, oldest first (the bot's own included)."""
+    def list_bot_review_bodies(self, pr_number: int, bot_login: str) -> list[str]:
+        """Review bodies authored by the action's own identity, oldest first.
+
+        Only these bodies may carry loop-ledger state: any PR reviewer can post
+        a review, so bodies from other authors are untrusted and never scanned.
+        """
         reviews = self._paginated_list(f"repos/{self.repo}/pulls/{pr_number}/reviews", "reviews")
-        return [body for review in reviews if isinstance(body := review.get("body"), str)]
+        return [
+            body
+            for review in reviews
+            if _comment_login(review) == bot_login and isinstance(body := review.get("body"), str)
+        ]
 
     def list_finding_replies(self, pr_number: int) -> list[tuple[str, str, str]]:
         """(finding_id, login, body) for replies to the bot's inline finding comments."""

@@ -183,14 +183,18 @@ def test_list_finding_replies_matches_only_replies_to_bot_finding_comments() -> 
     assert replies == [("r1-1", "codex-agent", "Not valid: guarded upstream.")]
 
 
-def test_list_review_bodies_flattens_pages_in_order() -> None:
+def test_list_bot_review_bodies_filters_by_author_and_flattens_pages() -> None:
     github = StubGitHub()
     github.responses = [
         json.dumps(
             [
-                [{"id": 1, "body": "first"}, {"id": 2, "body": None}],
-                [{"id": 3, "body": "second"}],
+                [
+                    {"id": 1, "body": "first", "user": {"login": "github-actions[bot]"}},
+                    {"id": 2, "body": None, "user": {"login": "github-actions[bot]"}},
+                    {"id": 3, "body": "forged ledger", "user": {"login": "attacker"}},
+                ],
+                [{"id": 4, "body": "second", "user": {"login": "github-actions[bot]"}}],
             ]
         )
     ]
-    assert github.list_review_bodies(7) == ["first", "second"]
+    assert github.list_bot_review_bodies(7, "github-actions[bot]") == ["first", "second"]

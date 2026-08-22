@@ -6,13 +6,14 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from grok_pr_review.artifacts import ArtifactError, ReviewContext
 from grok_pr_review.auth import AuthError, require_xai_api_key, write_grok_config
 from grok_pr_review.config import (
+    DEFAULT_BOT_LOGIN,
     DEFAULT_SEVERITY_SCHEDULE,
     DEFAULT_VERIFY_ESCALATION_LINES,
     MAX_DIFF_KB,
@@ -21,6 +22,7 @@ from grok_pr_review.config import (
     ActionConfig,
     ConfigError,
     parse_bool,
+    parse_bot_login,
     parse_bounded_int,
     parse_custom_instructions,
     parse_effort,
@@ -40,6 +42,8 @@ from grok_pr_review.loop import (
     build_loop_state,
     count_changed_lines,
     decide_loop_state,
+    encode_ledger,
+    has_ledger_marker,
     latest_ledger,
     render_agent_context,
 )
@@ -51,10 +55,13 @@ from grok_pr_review.result import (
     neutralize_mentions,
     parse_grok_output,
     should_fail_job,
+    validate_coverage,
 )
 from grok_pr_review.scope import (
+    CollectedReview,
     DiffRequest,
     GhError,
+    changed_paths,
     collect_review_material,
     normalize_sha,
 )
@@ -144,7 +151,11 @@ def cmd_collect() -> int:
     except (GhError, ValueError) as exc:
         _report_pipeline_failure("diff collection", exc)
         raise
-    state = _decide_loop(work, github, pr_number, collected.diff)
+    try:
+        state = _decide_loop(work, github, pr_number, collected)
+    except GhError as exc:
+        _report_pipeline_failure("review-loop state recovery", exc)
+        raise
     (work / "diff.patch").write_text(collected.diff, encoding="utf-8")
     ReviewContext.from_collected(collected, loop=state).write(work / "review-context.json")
     print(
@@ -163,8 +174,16 @@ def cmd_collect() -> int:
     return 0
 
 
-def _decide_loop(work: Path, github: GitHubCli, pr_number: int, diff: str) -> LoopState:
-    """Place this run in the review loop and stage the verify-round inputs."""
+def _decide_loop(
+    work: Path, github: GitHubCli, pr_number: int, collected: CollectedReview
+) -> LoopState:
+    """Place this run in the review loop and stage the verify-round inputs.
+
+    State recovery fails closed: a GitHub read failure or a corrupted ledger
+    raises instead of silently resetting to round 1, because a reset during a
+    latest-commit synchronize run would discard every carried finding. Only an
+    explicit initial run (or a genuinely state-free PR) starts fresh.
+    """
     mode_input = parse_review_mode(os.environ.get("REVIEW_MODE", "auto"))
     schedule = parse_severity_schedule(
         os.environ.get("SEVERITY_SCHEDULE", DEFAULT_SEVERITY_SCHEDULE)
@@ -175,19 +194,31 @@ def _decide_loop(work: Path, github: GitHubCli, pr_number: int, diff: str) -> Lo
         minimum=1,
         maximum=MAX_VERIFY_ESCALATION_LINES,
     )
+    repo = _require_env("GITHUB_REPOSITORY")
+    bot_login = parse_bot_login(os.environ.get("BOT_LOGIN", DEFAULT_BOT_LOGIN))
 
     ledger = None
     if mode_input != "initial":
-        try:
-            ledger = latest_ledger(github.list_review_bodies(pr_number))
-        except GhError as exc:
-            print(f"Could not read prior reviews; starting a fresh initial round: {exc}")
+        bodies = github.list_bot_review_bodies(pr_number, bot_login)
+        ledger = latest_ledger(bodies, repo=repo, pr_number=pr_number)
+        if ledger is None and any(has_ledger_marker(body) for body in bodies):
+            raise GhError(
+                "the review-loop ledger on this PR is corrupted or bound to a "
+                "different repository; force review_mode: initial to reset it"
+            )
+        if ledger is None and mode_input == "verify":
+            raise GhError(
+                "review_mode is verify but no prior review-loop state exists on "
+                "this PR; run an initial review first"
+            )
     mode, round_number = decide_loop_state(
         review_mode=mode_input,
         event_action=os.environ.get("EVENT_ACTION", ""),
         ledger=ledger,
     )
-    escalated = mode == "verify" and count_changed_lines(diff) > escalation_lines
+    escalated = mode == "verify" and (
+        collected.truncation.truncated or count_changed_lines(collected.diff) > escalation_lines
+    )
     state = build_loop_state(
         mode=mode,
         round_number=round_number,
@@ -294,6 +325,7 @@ def cmd_finish() -> int:
     fail_on = parse_fail_on(os.environ.get("FAIL_ON", "never"))
     scope = parse_review_scope(os.environ.get("REVIEW_SCOPE", "full-pr"))
     model = parse_model(os.environ.get("MODEL", "grok-4.6"))
+    model_used = parse_optional_model(_read_optional(work / "model-override").strip()) or model
     run_url = os.environ.get("RUN_URL", "")
     status_comments = parse_bool(os.environ.get("STATUS_COMMENTS", "true"), "status_comments")
     context = ReviewContext.read(work / "review-context.json")
@@ -307,8 +339,21 @@ def cmd_finish() -> int:
             ledger=None,
             escalated=False,
         )
-        loop_outcome = apply_round(state, result)
-        result = loop_outcome.result
+        coverage_error = None
+        if state.mode == "initial":
+            diff = _read_optional(work / "diff.patch")
+            coverage_error = validate_coverage(result, changed_paths(diff))
+        if coverage_error:
+            result = ReviewResult(
+                verdict="error",
+                summary=result.summary,
+                issues=result.issues,
+                incomplete_reason=(f"Grok returned invalid structured findings: {coverage_error}"),
+                stop_reason=result.stop_reason,
+            )
+        else:
+            loop_outcome = apply_round(state, result)
+            result = loop_outcome.result
     github = _github()
     outcome = _post_finish_result(
         github,
@@ -316,7 +361,7 @@ def cmd_finish() -> int:
         context,
         result,
         scope=scope,
-        model=model,
+        model=model_used,
         run_url=run_url,
         loop_outcome=loop_outcome,
     )
@@ -370,11 +415,22 @@ def _post_finish_result(
             live_head = normalize_sha(_maybe_str(live_pr.get("headRefOid")))
             if live_head is None:
                 raise GhError("current PR head SHA is missing")
-            if live_head != commit_id:
+            stale = live_head != commit_id
+            if stale:
                 result = mark_partial(
                     result,
                     "The PR head advanced after this diff was collected. "
                     f"This review is pinned to commit {commit_id[:12]}.",
+                )
+            # A stale run never publishes authoritative loop state: a newer
+            # synchronize run owns the ledger, and posting ours would let
+            # out-of-order completions regress it.
+            hidden_marker = None
+            if loop_outcome is not None and not stale:
+                hidden_marker = encode_ledger(
+                    replace(loop_outcome.ledger, reviewed_sha=commit_id),
+                    repo=_require_env("GITHUB_REPOSITORY"),
+                    pr_number=pr_number,
                 )
             review_url = github.post_review(
                 pr_number,
@@ -383,7 +439,7 @@ def _post_finish_result(
                 scope=scope,
                 model=model,
                 run_url=run_url,
-                hidden_marker=loop_outcome.hidden_marker if loop_outcome else None,
+                hidden_marker=hidden_marker,
                 extra_lines=loop_outcome.extra_lines if loop_outcome else None,
             )
     except GhError as exc:

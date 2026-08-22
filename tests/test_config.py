@@ -116,3 +116,14 @@ def test_review_loop_inputs_parse_and_validate() -> None:
     assert parse_optional_model("grok-4-fast") == "grok-4-fast"
     with pytest.raises(ConfigError):
         parse_optional_model("bad name!")
+
+
+def test_bot_login_parses_and_rejects_whitespace() -> None:
+    import pytest
+
+    from grok_pr_review.config import ConfigError, parse_bot_login
+
+    assert parse_bot_login("") == "github-actions[bot]"
+    assert parse_bot_login("my-review-bot") == "my-review-bot"
+    with pytest.raises(ConfigError):
+        parse_bot_login("two words")

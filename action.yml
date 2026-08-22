@@ -91,6 +91,13 @@ inputs:
       fix-verification pass.
     required: false
     default: "500"
+  bot_login:
+    description: >-
+      GitHub login this action posts reviews as. Loop-ledger state is only
+      trusted from reviews authored by this identity. Change it when
+      github_token is a PAT or GitHub App token.
+    required: false
+    default: "github-actions[bot]"
 
 outputs:
   verdict:
@@ -143,6 +150,7 @@ runs:
         VERIFY_MODEL: ${{ inputs.verify_model }}
         VERIFY_EFFORT: ${{ inputs.verify_effort }}
         VERIFY_ESCALATION_LINES: ${{ inputs.verify_escalation_lines }}
+        BOT_LOGIN: ${{ inputs.bot_login }}
       run: python3 -m grok_pr_review validate-inputs
 
     - name: Require XAI_API_KEY
@@ -188,6 +196,7 @@ runs:
         VERIFY_MODEL: ${{ inputs.verify_model }}
         VERIFY_EFFORT: ${{ inputs.verify_effort }}
         VERIFY_ESCALATION_LINES: ${{ inputs.verify_escalation_lines }}
+        BOT_LOGIN: ${{ inputs.bot_login }}
       run: python3 -m grok_pr_review collect
 
     - name: Prepare isolated review workspace

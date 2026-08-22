@@ -189,6 +189,17 @@ def _cut_diff_at_boundary(data: bytes, limit: int) -> bytes:
     return prefix
 
 
+def changed_paths(diff_text: str) -> set[str]:
+    """File paths touched by a unified diff (old and new sides, no /dev/null)."""
+    paths: set[str] = set()
+    for line in diff_text.splitlines():
+        if line.startswith("--- a/"):
+            paths.add(line[6:].strip())
+        elif line.startswith("+++ b/"):
+            paths.add(line[6:].strip())
+    return {path for path in paths if path}
+
+
 def fetch_scoped_diff(
     pr_number: int,
     plan: DiffPlan,
