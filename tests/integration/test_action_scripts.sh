@@ -52,3 +52,6 @@ owned="$test_root/grok-pr-review.ABC123"
 mkdir -p "$owned"
 bash "$repo_root/scripts/cleanup-workdir.sh" "$owned" "$test_root"
 [[ ! -e "$owned" ]]
+
+# An empty WORK (prepare step failed or run cancelled) is a no-op, not a failure.
+bash "$repo_root/scripts/cleanup-workdir.sh" "" "$test_root"

@@ -519,3 +519,37 @@ def test_prepare_workspace_failure_posts_a_visible_pipeline_comment(
     assert github.comment is not None
     assert "pipeline failed during workspace preparation" in github.comment[1]
     assert "could not inspect reviewed commit" in github.comment[1]
+
+
+def test_finish_posts_an_incomplete_comment_when_review_posting_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_completed_run(tmp_path)
+    output = _set_finish_env(monkeypatch, tmp_path)
+
+    class ReviewPostFails(RecordingGitHub):
+        def post_review(self, *_args: Any, **_kwargs: Any) -> str:
+            raise GhError("502 bad gateway")
+
+    github = ReviewPostFails()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 1
+    assert github.incomplete_result is not None
+    assert github.incomplete_result.verdict == "error"
+    assert "Failed to post PR feedback" in (github.incomplete_result.incomplete_reason or "")
+    written = output.read_text(encoding="utf-8")
+    assert "verdict=error" in written
+    assert "review_url=https://example.test/incomplete" in written
+
+
+def test_update_status_survives_a_status_lookup_failure(tmp_path: Path) -> None:
+    class LookupFails:
+        def find_status_comment(self, _number: int) -> int | None:
+            raise GhError("rate limited")
+
+        def upsert_status_comment(self, _number: int, _body: str, _existing: int | None) -> int:
+            raise AssertionError("upsert should not run when the lookup fails")
+
+    result = ReviewResult(verdict="clean", summary="ok")
+    cli._update_status(LookupFails(), tmp_path, 7, result, "full-pr", "", enabled=True)

@@ -300,6 +300,12 @@ def _post_finish_result(
             stop_reason=result.stop_reason,
             partial_reason=result.partial_reason,
         )
+        try:
+            review_url = github.post_incomplete(
+                pr_number, result, scope=scope, model=model, run_url=run_url
+            )
+        except GhError as post_exc:
+            print(f"Could not post the incomplete-review comment: {post_exc}")
     return FinishOutcome(result=result, review_url=review_url)
 
 
@@ -359,7 +365,6 @@ def _update_status(
     if not enabled:
         return
     ident = _read_optional(work / "status-comment-id").strip()
-    comment_id = int(ident) if ident.isdigit() else github.find_status_comment(pr_number)
     summary = f"Grok review finished: `{result.verdict}` (scope `{scope}`)."
     if review_url:
         summary += f"\n\n{review_url}"
@@ -368,6 +373,7 @@ def _update_status(
     if result.partial_reason:
         summary += f"\n\nPartial review: {neutralize_mentions(result.partial_reason)}"
     try:
+        comment_id = int(ident) if ident.isdigit() else github.find_status_comment(pr_number)
         github.upsert_status_comment(pr_number, summary, comment_id)
     except GhError as exc:
         print(f"Could not update status comment: {exc}")
