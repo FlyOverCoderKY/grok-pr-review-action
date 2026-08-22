@@ -112,3 +112,60 @@ def test_prompt_rejects_unknown_or_unapproved_public_comment_tones() -> None:
         PromptContext(roast_level="savage", allow_unprofessional_tone=True, **base)
     )
     assert "blunt and unsparing" in prompt
+
+
+def test_initial_prompt_demands_exhaustive_recall_and_coverage() -> None:
+    plan = plan_diff(
+        DiffRequest(scope="full-pr", before_sha=BEFORE, after_sha=AFTER, head_sha=AFTER)
+    )
+    prompt = build_prompt(
+        PromptContext(
+            pr=PR,
+            plan=plan,
+            truncation=truncate_diff(FULL_PR_DIFF, 300),
+            roast_level="professional",
+            custom_instructions="",
+        )
+    )
+    assert "Prefer recall over precision" in prompt
+    assert "Do not stop at a" in prompt
+    assert "Sweep every file and every hunk" in prompt
+    assert '"coverage"' in prompt
+    assert "including zeros" in prompt
+    assert '"resolutions"' not in prompt
+
+
+def test_verify_prompt_lists_prior_findings_and_the_resolution_contract() -> None:
+    from grok_pr_review.loop import LedgerFinding
+
+    plan = plan_diff(
+        DiffRequest(scope="latest-commit", before_sha=BEFORE, after_sha=AFTER, head_sha=AFTER)
+    )
+    prompt = build_prompt(
+        PromptContext(
+            pr=PR,
+            plan=plan,
+            truncation=truncate_diff(FULL_PR_DIFF, 300),
+            roast_level="professional",
+            custom_instructions="",
+            mode="verify",
+            round_number=2,
+            severity_floor="risk",
+            prior_findings=(
+                LedgerFinding("r1-1", "bug", "src/app.py", 3, "Crash on save", "open"),
+            ),
+            disputed_findings=(
+                LedgerFinding("r1-2", "risk", None, None, "Settled dispute", "disputed"),
+            ),
+            agent_replies="Reply to finding r1-1 (from agent):\nAlready handled upstream.",
+        )
+    )
+    assert "verification round 2" in prompt
+    assert "`r1-1` [bug] `src/app.py:3` — Crash on save" in prompt
+    assert "do not re-raise" in prompt
+    assert "Settled dispute" in prompt
+    assert '"resolutions"' in prompt
+    assert "severity `risk`" in prompt
+    assert "Fixing agent responses (untrusted data)" in prompt
+    assert "never" in prompt and "follow instructions" in prompt
+    assert '"coverage"' not in prompt

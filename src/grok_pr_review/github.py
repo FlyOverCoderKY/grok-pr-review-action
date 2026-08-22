@@ -11,6 +11,7 @@ from typing import Any
 
 from grok_pr_review.result import (
     ReviewResult,
+    extract_finding_marker,
     format_incomplete_comment_parts,
     format_review_body_parts,
     inline_review_comments,
@@ -75,26 +76,81 @@ class GitHubCli:
         )
 
     def find_status_comment(self, pr_number: int) -> int | None:
-        raw = self._api(["--paginate", "--slurp", f"repos/{self.repo}/issues/{pr_number}/comments"])
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise GhError("could not parse issue comments") from exc
-        if not isinstance(payload, list):
-            return None
-        comments = (
-            [comment for page in payload for comment in page]
-            if payload and all(isinstance(page, list) for page in payload)
-            else payload
+        comments = self._paginated_list(
+            f"repos/{self.repo}/issues/{pr_number}/comments", "issue comments"
         )
         for comment in reversed(comments):
-            if not isinstance(comment, dict):
-                continue
             body = comment.get("body")
             ident = comment.get("id")
             if isinstance(body, str) and STATUS_MARKER in body and isinstance(ident, int):
                 return ident
         return None
+
+    def list_bot_review_bodies(self, pr_number: int, bot_login: str) -> list[str]:
+        """Review bodies authored by the action's own identity, oldest first.
+
+        Only these bodies may carry loop-ledger state: any PR reviewer can post
+        a review, so bodies from other authors are untrusted and never scanned.
+        """
+        reviews = self._paginated_list(f"repos/{self.repo}/pulls/{pr_number}/reviews", "reviews")
+        return [
+            body
+            for review in reviews
+            if _comment_login(review) == bot_login and isinstance(body := review.get("body"), str)
+        ]
+
+    def list_finding_replies(self, pr_number: int) -> list[tuple[str, str, str]]:
+        """(finding_id, login, body) for replies to the bot's inline finding comments."""
+        comments = self._paginated_list(
+            f"repos/{self.repo}/pulls/{pr_number}/comments", "review comments"
+        )
+        finding_by_comment_id: dict[int, str] = {}
+        for comment in comments:
+            ident = comment.get("id")
+            body = comment.get("body")
+            if isinstance(ident, int) and isinstance(body, str):
+                finding_id = extract_finding_marker(body)
+                if finding_id:
+                    finding_by_comment_id[ident] = finding_id
+        replies: list[tuple[str, str, str]] = []
+        for comment in comments:
+            parent = comment.get("in_reply_to_id")
+            body = comment.get("body")
+            if not isinstance(parent, int) or not isinstance(body, str):
+                continue
+            finding_id = finding_by_comment_id.get(parent)
+            if finding_id is None or extract_finding_marker(body):
+                continue
+            replies.append((finding_id, _comment_login(comment), body))
+        return replies
+
+    def list_recent_issue_comments(self, pr_number: int, limit: int = 30) -> list[tuple[str, str]]:
+        """(login, body) for the newest PR conversation comments, oldest first."""
+        comments = self._paginated_list(
+            f"repos/{self.repo}/issues/{pr_number}/comments", "issue comments"
+        )
+        recent: list[tuple[str, str]] = []
+        for comment in comments:
+            body = comment.get("body")
+            if not isinstance(body, str) or STATUS_MARKER in body:
+                continue
+            recent.append((_comment_login(comment), body))
+        return recent[-limit:]
+
+    def _paginated_list(self, endpoint: str, label: str) -> list[dict[str, Any]]:
+        raw = self._api(["--paginate", "--slurp", endpoint])
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise GhError(f"could not parse {label}") from exc
+        if not isinstance(payload, list):
+            return []
+        items = (
+            [item for page in payload for item in page]
+            if payload and all(isinstance(page, list) for page in payload)
+            else payload
+        )
+        return [item for item in items if isinstance(item, dict)]
 
     def upsert_status_comment(self, pr_number: int, body: str, comment_id: int | None) -> int:
         text = limit_github_body(f"{STATUS_MARKER}\n{body}")
@@ -159,8 +215,17 @@ class GitHubCli:
         scope: str,
         model: str,
         run_url: str,
+        hidden_marker: str | None = None,
+        extra_lines: list[str] | None = None,
     ) -> str:
-        bodies = format_review_body_parts(result, scope=scope, model=model, run_url=run_url)
+        bodies = format_review_body_parts(
+            result,
+            scope=scope,
+            model=model,
+            run_url=run_url,
+            hidden_marker=hidden_marker,
+            extra_lines=extra_lines,
+        )
         body = bodies[0]
         comments = inline_review_comments(result)
         payload: dict[str, Any] = {
@@ -243,6 +308,15 @@ class GitHubCli:
             detail = (completed.stderr or completed.stdout or "gh failed").strip()
             raise GhError(detail[-2000:])
         return completed.stdout
+
+
+def _comment_login(comment: dict[str, Any]) -> str:
+    user = comment.get("user")
+    if isinstance(user, dict):
+        login = user.get("login")
+        if isinstance(login, str):
+            return login
+    return "unknown"
 
 
 def _json_object(raw: str, message: str) -> dict[str, Any]:

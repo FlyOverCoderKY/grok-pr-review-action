@@ -6,26 +6,48 @@ import argparse
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from grok_pr_review.artifacts import ArtifactError, ReviewContext
 from grok_pr_review.auth import AuthError, require_xai_api_key, write_grok_config
 from grok_pr_review.config import (
+    DEFAULT_BOT_LOGIN,
+    DEFAULT_SEVERITY_SCHEDULE,
+    DEFAULT_VERIFY_ESCALATION_LINES,
     MAX_DIFF_KB,
     MAX_GITHUB_TIMEOUT_SECONDS,
+    MAX_VERIFY_ESCALATION_LINES,
     ActionConfig,
     ConfigError,
+    Severity,
     parse_bool,
+    parse_bot_login,
     parse_bounded_int,
     parse_custom_instructions,
+    parse_effort,
     parse_fail_on,
     parse_model,
+    parse_optional_model,
+    parse_review_mode,
     parse_review_scope,
     parse_roast_level,
+    parse_severity_schedule,
 )
 from grok_pr_review.github import GitHubCli
+from grok_pr_review.loop import (
+    Ledger,
+    LoopState,
+    RoundOutcome,
+    apply_round,
+    build_loop_state,
+    count_changed_lines,
+    decide_loop_state,
+    encode_ledger,
+    latest_ledger,
+    render_agent_context,
+)
 from grok_pr_review.prompt import build_prompt_from_collected
 from grok_pr_review.result import (
     ReviewResult,
@@ -34,10 +56,14 @@ from grok_pr_review.result import (
     neutralize_mentions,
     parse_grok_output,
     should_fail_job,
+    validate_coverage,
+    validate_issue_paths,
 )
 from grok_pr_review.scope import (
+    CollectedReview,
     DiffRequest,
     GhError,
+    changed_paths,
     collect_review_material,
     normalize_sha,
 )
@@ -94,7 +120,8 @@ def cmd_write_config() -> int:
     require_xai_api_key()
     grok_home = Path(_require_env("GROK_HOME"))
     model = parse_model(os.environ.get("MODEL", "grok-4.6"))
-    path = write_grok_config(grok_home, model)
+    verify_model = parse_optional_model(os.environ.get("VERIFY_MODEL", ""))
+    path = write_grok_config(grok_home, model, [verify_model] if verify_model else [])
     print(f"Wrote {path} (api.x.ai, env_key=XAI_API_KEY).")
     return 0
 
@@ -112,6 +139,18 @@ def cmd_collect() -> int:
     before, after, head = _event_shas()
     github = _github()
     try:
+        ledger, mode, round_number, schedule, escalation_lines = _resolve_loop_position(
+            github, pr_number, scope
+        )
+    except GhError as exc:
+        _report_pipeline_failure("review-loop state recovery", exc)
+        raise
+    if mode == "verify" and scope == "latest-commit" and ledger is not None:
+        # Continuity: verify everything since the last published review, not
+        # just this push's webhook range, so a run racing an unfinished older
+        # run can never skip the commits that run was reviewing.
+        before = ledger.reviewed_sha or before
+    try:
         collected = collect_review_material(
             pr_number=pr_number,
             request=DiffRequest(
@@ -126,17 +165,134 @@ def cmd_collect() -> int:
     except (GhError, ValueError) as exc:
         _report_pipeline_failure("diff collection", exc)
         raise
+    state = _stage_loop_inputs(
+        work,
+        github,
+        pr_number,
+        collected,
+        ledger=ledger,
+        mode=mode,
+        round_number=round_number,
+        schedule=schedule,
+        escalation_lines=escalation_lines,
+    )
     (work / "diff.patch").write_text(collected.diff, encoding="utf-8")
-    ReviewContext.from_collected(collected).write(work / "review-context.json")
+    ReviewContext.from_collected(collected, loop=state).write(work / "review-context.json")
     print(
         f"Collected {collected.plan.kind} diff "
         f"({collected.truncation.embedded_bytes} bytes embedded)."
+    )
+    print(
+        f"Review round {state.round_number} ({state.mode}, "
+        f"severity floor {state.severity_floor}"
+        f"{', escalated to a full-severity review' if state.escalated else ''})."
     )
     if collected.plan.fallback_notice:
         print(collected.plan.fallback_notice)
     if collected.truncation.notice:
         print(collected.truncation.notice)
     return 0
+
+
+def _resolve_loop_position(
+    github: GitHubCli, pr_number: int, scope: str
+) -> tuple[Ledger | None, str, int, tuple[Severity, ...], int]:
+    """Recover the loop position before collecting the diff.
+
+    State recovery fails closed: a GitHub read failure or a corrupted newest
+    ledger raises instead of silently resetting to round 1, because a reset
+    during a latest-commit synchronize run would discard every carried
+    finding. A state-free synchronize run is likewise refused under
+    latest-commit scope, where an "initial" review of one push could report
+    clean without ever seeing the rest of the PR. Only an explicit initial
+    run (or a state-free full-pr collection) starts fresh.
+    """
+    mode_input = parse_review_mode(os.environ.get("REVIEW_MODE", "auto"))
+    schedule = parse_severity_schedule(
+        os.environ.get("SEVERITY_SCHEDULE", DEFAULT_SEVERITY_SCHEDULE)
+    )
+    escalation_lines = parse_bounded_int(
+        os.environ.get("VERIFY_ESCALATION_LINES", str(DEFAULT_VERIFY_ESCALATION_LINES)),
+        "verify_escalation_lines",
+        minimum=1,
+        maximum=MAX_VERIFY_ESCALATION_LINES,
+    )
+    repo = _require_env("GITHUB_REPOSITORY")
+    bot_login = parse_bot_login(os.environ.get("BOT_LOGIN", DEFAULT_BOT_LOGIN))
+    event_action = os.environ.get("EVENT_ACTION", "").strip().lower()
+
+    ledger = None
+    if mode_input != "initial":
+        bodies = github.list_bot_review_bodies(pr_number, bot_login)
+        ledger = latest_ledger(bodies, repo=repo, pr_number=pr_number)
+        if ledger is None and mode_input == "verify":
+            raise GhError(
+                "review_mode is verify but no prior review-loop state exists on "
+                "this PR; run an initial review first"
+            )
+        if ledger is None and event_action == "synchronize" and scope == "latest-commit":
+            raise GhError(
+                "this synchronize run collects only the latest commit and no "
+                "prior review-loop state exists, so carried findings cannot be "
+                "verified; run an initial full-PR review first "
+                "(review_mode: initial, review_scope: full-pr)"
+            )
+    mode, round_number = decide_loop_state(
+        review_mode=mode_input,
+        event_action=event_action,
+        ledger=ledger,
+    )
+    if mode == "initial" and scope != "full-pr":
+        raise GhError(
+            "an initial review must use review_scope: full-pr so the loop is "
+            "seeded from the complete pull request"
+        )
+    return ledger, mode, round_number, schedule, escalation_lines
+
+
+def _stage_loop_inputs(
+    work: Path,
+    github: GitHubCli,
+    pr_number: int,
+    collected: CollectedReview,
+    *,
+    ledger: Ledger | None,
+    mode: str,
+    round_number: int,
+    schedule: tuple[Severity, ...],
+    escalation_lines: int,
+) -> LoopState:
+    """Build the loop state from the collected diff and stage verify inputs."""
+    escalated = mode == "verify" and (
+        collected.truncation.truncated or count_changed_lines(collected.diff) > escalation_lines
+    )
+    state = build_loop_state(
+        mode=mode,
+        round_number=round_number,
+        schedule=schedule,
+        ledger=ledger,
+        escalated=escalated,
+    )
+
+    replies_text = ""
+    if state.mode == "verify":
+        try:
+            replies_text = render_agent_context(
+                github.list_finding_replies(pr_number),
+                github.list_recent_issue_comments(pr_number),
+            )
+        except GhError as exc:
+            print(f"Could not fetch reviewer replies; verifying from commits only: {exc}")
+    (work / "agent-replies.md").write_text(replies_text, encoding="utf-8")
+
+    verify_model = parse_optional_model(os.environ.get("VERIFY_MODEL", ""))
+    verify_effort = parse_effort(os.environ.get("VERIFY_EFFORT", ""))
+    if state.mode == "verify" and not state.escalated:
+        if verify_model:
+            (work / "model-override").write_text(verify_model, encoding="utf-8")
+        if verify_effort:
+            (work / "effort-override").write_text(verify_effort, encoding="utf-8")
+    return state
 
 
 def cmd_prompt() -> int:
@@ -155,6 +311,8 @@ def cmd_prompt() -> int:
         ),
         custom_instructions=parse_custom_instructions(os.environ.get("CUSTOM_INSTRUCTIONS", "")),
         allow_unprofessional_tone=allow_unprofessional,
+        loop_state=context.loop,
+        agent_replies=_read_optional(work / "agent-replies.md").strip(),
     )
     (work / "prompt.md").write_text(text, encoding="utf-8")
     print(f"Wrote {work / 'prompt.md'} ({len(text.encode())} bytes).")
@@ -214,10 +372,38 @@ def cmd_finish() -> int:
     fail_on = parse_fail_on(os.environ.get("FAIL_ON", "never"))
     scope = parse_review_scope(os.environ.get("REVIEW_SCOPE", "full-pr"))
     model = parse_model(os.environ.get("MODEL", "grok-4.6"))
+    model_used = parse_optional_model(_read_optional(work / "model-override").strip()) or model
     run_url = os.environ.get("RUN_URL", "")
     status_comments = parse_bool(os.environ.get("STATUS_COMMENTS", "true"), "status_comments")
     context = ReviewContext.read(work / "review-context.json")
     result = _parse_finish_result(work, context)
+    loop_outcome: RoundOutcome | None = None
+    if not result.incomplete:
+        state = context.loop or build_loop_state(
+            mode="initial",
+            round_number=1,
+            schedule=parse_severity_schedule(DEFAULT_SEVERITY_SCHEDULE),
+            ledger=None,
+            escalated=False,
+        )
+        diff = _read_optional(work / "diff.patch")
+        diff_paths = changed_paths(diff)
+        validation_error = validate_issue_paths(result, diff_paths)
+        if validation_error is None and state.mode == "initial":
+            validation_error = validate_coverage(result, diff_paths)
+        if validation_error:
+            result = ReviewResult(
+                verdict="error",
+                summary=result.summary,
+                issues=result.issues,
+                incomplete_reason=(
+                    f"Grok returned invalid structured findings: {validation_error}"
+                ),
+                stop_reason=result.stop_reason,
+            )
+        else:
+            loop_outcome = apply_round(state, result)
+            result = loop_outcome.result
     github = _github()
     outcome = _post_finish_result(
         github,
@@ -225,8 +411,9 @@ def cmd_finish() -> int:
         context,
         result,
         scope=scope,
-        model=model,
+        model=model_used,
         run_url=run_url,
+        loop_outcome=loop_outcome,
     )
     return _finalize_finish(
         github,
@@ -236,6 +423,8 @@ def cmd_finish() -> int:
         scope=scope,
         fail_on=fail_on,
         status_comments=status_comments,
+        loop_outcome=loop_outcome,
+        round_number=context.loop.round_number if context.loop else 1,
     )
 
 
@@ -246,6 +435,17 @@ def _parse_finish_result(work: Path, context: ReviewContext) -> ReviewResult:
     if context.truncated:
         reason = context.truncation_notice or "The diff was truncated."
         result = mark_partial(result, reason)
+    if (
+        context.loop is not None
+        and context.loop.mode == "verify"
+        and context.plan.kind == "single-commit"
+        and context.plan.fallback_notice
+    ):
+        result = mark_partial(
+            result,
+            "History diverged, so this verification round embedded only the "
+            "single latest commit instead of the full range since the last review.",
+        )
     return result
 
 
@@ -258,6 +458,7 @@ def _post_finish_result(
     scope: str,
     model: str,
     run_url: str,
+    loop_outcome: RoundOutcome | None = None,
 ) -> FinishOutcome:
     review_url = ""
     try:
@@ -275,11 +476,22 @@ def _post_finish_result(
             live_head = normalize_sha(_maybe_str(live_pr.get("headRefOid")))
             if live_head is None:
                 raise GhError("current PR head SHA is missing")
-            if live_head != commit_id:
+            stale = live_head != commit_id
+            if stale:
                 result = mark_partial(
                     result,
                     "The PR head advanced after this diff was collected. "
                     f"This review is pinned to commit {commit_id[:12]}.",
+                )
+            # A stale or partial run never publishes authoritative loop state.
+            # The previous complete marker remains the retry boundary, so a
+            # truncated or fallback diff cannot permanently skip unseen code.
+            hidden_marker = None
+            if loop_outcome is not None and not stale and result.verdict != "partial":
+                hidden_marker = encode_ledger(
+                    replace(loop_outcome.ledger, reviewed_sha=commit_id),
+                    repo=_require_env("GITHUB_REPOSITORY"),
+                    pr_number=pr_number,
                 )
             review_url = github.post_review(
                 pr_number,
@@ -288,6 +500,8 @@ def _post_finish_result(
                 scope=scope,
                 model=model,
                 run_url=run_url,
+                hidden_marker=hidden_marker,
+                extra_lines=loop_outcome.extra_lines if loop_outcome else None,
             )
     except GhError as exc:
         reason = f"Failed to post PR feedback: {exc}"
@@ -318,8 +532,18 @@ def _finalize_finish(
     scope: str,
     fail_on: str,
     status_comments: bool,
+    loop_outcome: RoundOutcome | None = None,
+    round_number: int = 1,
 ) -> int:
     result = outcome.result
+    if loop_outcome is not None and not result.incomplete:
+        counting_open = True
+        issue_count = loop_outcome.open_issue_count
+        bug_count = loop_outcome.open_bug_count
+    else:
+        counting_open = False
+        issue_count = result.issue_count
+        bug_count = result.bug_count
     _update_status(
         github,
         work,
@@ -329,13 +553,20 @@ def _finalize_finish(
         outcome.review_url,
         enabled=status_comments,
     )
-    _write_outputs(result, outcome.review_url)
+    _write_outputs(
+        result,
+        outcome.review_url,
+        issue_count=issue_count,
+        bug_count=bug_count,
+        round_number=round_number,
+    )
     (work / "result.json").write_text(
         json.dumps(
             {
                 "verdict": result.verdict,
-                "issue_count": result.issue_count,
-                "bug_count": result.bug_count,
+                "issue_count": issue_count,
+                "bug_count": bug_count,
+                "round": round_number,
                 "review_url": outcome.review_url,
                 "incomplete_reason": result.incomplete_reason,
                 "partial_reason": result.partial_reason,
@@ -344,8 +575,13 @@ def _finalize_finish(
         ),
         encoding="utf-8",
     )
-    print(f"verdict={result.verdict} issues={result.issue_count} bugs={result.bug_count}")
-    if should_fail_job(fail_on, result):
+    print(f"verdict={result.verdict} issues={issue_count} bugs={bug_count} round={round_number}")
+    if should_fail_job(
+        fail_on,
+        result,
+        open_bug_count=bug_count if counting_open else None,
+        open_issue_count=issue_count if counting_open else None,
+    ):
         reason = "the review did not complete" if result.incomplete else f"fail_on={fail_on}"
         print(f"Failing the job because {reason}.")
         return 1
@@ -379,14 +615,22 @@ def _update_status(
         print(f"Could not update status comment: {exc}")
 
 
-def _write_outputs(result: ReviewResult, review_url: str) -> None:
+def _write_outputs(
+    result: ReviewResult,
+    review_url: str,
+    *,
+    issue_count: int,
+    bug_count: int,
+    round_number: int,
+) -> None:
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
         return
     with Path(output_path).open("a", encoding="utf-8") as handle:
         handle.write(f"verdict={result.verdict}\n")
-        handle.write(f"issue_count={result.issue_count}\n")
-        handle.write(f"bug_count={result.bug_count}\n")
+        handle.write(f"issue_count={issue_count}\n")
+        handle.write(f"bug_count={bug_count}\n")
+        handle.write(f"round={round_number}\n")
         handle.write(f"review_url={review_url}\n")
 
 

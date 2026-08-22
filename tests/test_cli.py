@@ -27,6 +27,9 @@ class RecordingGitHub:
     def pr_view(self, number: int) -> dict[str, object]:
         return {"number": number, "headRefOid": self.live_head}
 
+    def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+        return []
+
     def post_review(
         self,
         _number: int,
@@ -38,6 +41,7 @@ class RecordingGitHub:
             raise GhError("permission denied")
         self.commit_id = commit_id
         self.result = result
+        self.post_kwargs = _kwargs
         return "https://example.test/review"
 
     def post_incomplete(
@@ -111,6 +115,7 @@ def _set_finish_env(monkeypatch: pytest.MonkeyPatch, work: Path) -> Path:
         "FAIL_ON": "never",
         "STATUS_COMMENTS": "false",
         "GITHUB_OUTPUT": str(output),
+        "GITHUB_REPOSITORY": "owner/repo",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)
@@ -256,10 +261,16 @@ def test_collect_command_writes_the_pinned_scope_artifacts(
         "REVIEW_SCOPE": "full-pr",
         "MAX_DIFF_KB": "300",
         "HEAD_SHA": head,
+        "GITHUB_REPOSITORY": "owner/repo",
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
-    monkeypatch.setattr(cli, "_github", object)
+
+    class NoHistoryGitHub:
+        def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+            return []
+
+    monkeypatch.setattr(cli, "_github", NoHistoryGitHub)
 
     expected = CollectedReview(
         pr={"number": 7, "headRefOid": head},
@@ -370,6 +381,7 @@ def test_mocked_pipeline_preserves_the_review_boundary_and_reviewed_sha(
         "HEAD_SHA": reviewed_sha,
         "STATUS_COMMENTS": "false",
         "FAIL_ON": "never",
+        "GITHUB_REPOSITORY": "owner/repo",
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
@@ -389,7 +401,13 @@ def test_mocked_pipeline_preserves_the_review_boundary_and_reviewed_sha(
     assert "diff --git a/app.py" in (work / "prompt.md").read_text(encoding="utf-8")
 
     envelope = {
-        "text": json.dumps({"summary": "Looks good.", "issues": []}),
+        "text": json.dumps(
+            {
+                "summary": "Looks good.",
+                "issues": [],
+                "coverage": [{"path": "app.py", "findings": 0}],
+            }
+        ),
         "stopReason": "EndTurn",
     }
     (work / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
@@ -451,6 +469,9 @@ class PipelineFailureGitHub:
     def __init__(self) -> None:
         self.comment: tuple[int, str] | None = None
 
+    def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+        return []
+
     def post_issue_comment(self, pr_number: int, body: str) -> str:
         self.comment = (pr_number, body)
         return "https://example.test/failure-comment"
@@ -467,6 +488,7 @@ def test_collect_failure_posts_a_visible_pipeline_comment(
         "MAX_DIFF_KB": "300",
         "HEAD_SHA": REVIEWED_SHA,
         "RUN_URL": "https://example.test/run",
+        "GITHUB_REPOSITORY": "owner/repo",
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
@@ -553,3 +575,413 @@ def test_update_status_survives_a_status_lookup_failure(tmp_path: Path) -> None:
 
     result = ReviewResult(verdict="clean", summary="ok")
     cli._update_status(LookupFails(), tmp_path, 7, result, "full-pr", "", enabled=True)
+
+
+def test_finish_verify_round_reports_resolutions_and_open_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grok_pr_review.loop import LedgerFinding, LoopState, extract_ledger
+
+    _write_completed_run(tmp_path)
+    envelope = {
+        "text": json.dumps(
+            {
+                "summary": "Verified the fixes.",
+                "issues": [],
+                "resolutions": [
+                    {"id": "r1-1", "status": "not_fixed", "note": "still crashes"},
+                    {"id": "r1-2", "status": "fixed", "note": "resolved"},
+                ],
+            }
+        ),
+        "stopReason": "EndTurn",
+    }
+    (tmp_path / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
+    ReviewContext(
+        pr={"number": 7, "headRefOid": REVIEWED_SHA},
+        plan=DiffPlan("full-pr", "full-pr", None, REVIEWED_SHA, None),
+        truncated=False,
+        original_bytes=1,
+        embedded_bytes=1,
+        max_diff_kb=300,
+        loop=LoopState(
+            mode="verify",
+            round_number=2,
+            severity_floor="risk",
+            escalated=False,
+            retired=1,
+            prior_findings=(
+                LedgerFinding("r1-1", "bug", "src/app.py", 3, "Crash on save", "open"),
+                LedgerFinding("r1-2", "risk", None, None, "Race in setup", "open"),
+            ),
+        ),
+    ).write(tmp_path / "review-context.json")
+    output = _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 0
+    assert github.result is not None
+    assert github.result.verdict == "issues"
+    written = output.read_text(encoding="utf-8")
+    assert "verdict=issues" in written
+    assert "issue_count=1" in written
+    assert "bug_count=1" in written
+    assert "round=2" in written
+    ledger = extract_ledger(github.post_kwargs["hidden_marker"], repo="owner/repo", pr_number=7)
+    assert ledger is not None
+    assert {finding.id for finding in ledger.findings} == {"r1-1"}
+    report = "\n".join(github.post_kwargs["extra_lines"])
+    assert "Round 2 resolution" in report
+    assert "`r1-1` not fixed" in report
+    assert "still crashes" in report
+
+
+def test_collect_verify_round_reads_ledger_and_stages_verify_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grok_pr_review.loop import Ledger, LedgerFinding, encode_ledger
+
+    head = "a" * 40
+    work = tmp_path / "work"
+    for name, value in {
+        "WORK": str(work),
+        "PR_NUMBER": "7",
+        "REVIEW_SCOPE": "latest-commit",
+        "MAX_DIFF_KB": "300",
+        "HEAD_SHA": head,
+        "EVENT_ACTION": "synchronize",
+        "VERIFY_MODEL": "grok-4-fast",
+        "VERIFY_EFFORT": "low",
+        "GITHUB_REPOSITORY": "owner/repo",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+
+    last_reviewed = "b" * 40
+    prior = encode_ledger(
+        Ledger(
+            1,
+            (LedgerFinding("r1-1", "bug", "src/app.py", 3, "Crash", "open"),),
+            reviewed_sha=last_reviewed,
+        ),
+        repo="owner/repo",
+        pr_number=7,
+    )
+
+    class LoopGitHub:
+        def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+            return [f"## Grok PR review\n{prior}\n"]
+
+        def list_finding_replies(self, _number: int) -> list[tuple[str, str, str]]:
+            return [("r1-1", "codex-agent", "Not a real issue.")]
+
+        def list_recent_issue_comments(self, _number: int) -> list[tuple[str, str]]:
+            return [("nathan", "Please re-check the retry path.")]
+
+    monkeypatch.setattr(cli, "_github", LoopGitHub)
+    collected = CollectedReview(
+        pr={"number": 7, "headRefOid": head},
+        plan=DiffPlan("latest-commit", "single-commit", None, head, None),
+        truncation=Truncation("diff --git a/a b/a\n+x\n", False, 22, 22, 300),
+    )
+    captured_request: dict[str, Any] = {}
+
+    def capture(**kwargs: Any) -> CollectedReview:
+        captured_request.update(kwargs)
+        return collected
+
+    monkeypatch.setattr(cli, "collect_review_material", capture)
+
+    assert cli.cmd_collect() == 0
+    # Continuity: the verify diff starts at the last published review's SHA,
+    # not this push's webhook range.
+    assert captured_request["request"].before_sha == last_reviewed
+    context = ReviewContext.read(work / "review-context.json")
+    assert context.loop is not None
+    assert context.loop.mode == "verify"
+    assert context.loop.round_number == 2
+    assert context.loop.severity_floor == "risk"
+    assert [finding.id for finding in context.loop.prior_findings] == ["r1-1"]
+    assert (work / "model-override").read_text(encoding="utf-8") == "grok-4-fast"
+    assert (work / "effort-override").read_text(encoding="utf-8") == "low"
+    replies = (work / "agent-replies.md").read_text(encoding="utf-8")
+    assert "Reply to finding r1-1 (from codex-agent):" in replies
+    assert "PR comment (from nathan):" in replies
+
+
+def test_stale_finish_posts_the_review_but_never_publishes_ledger_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_completed_run(tmp_path)
+    _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub(live_head=NEW_HEAD_SHA)
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 0
+    assert github.result is not None
+    assert github.result.verdict == "partial"
+    assert github.post_kwargs["hidden_marker"] is None
+
+
+def test_partial_finish_posts_feedback_but_keeps_the_previous_ledger_authoritative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_completed_run(tmp_path, truncated=True)
+    _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 0
+    assert github.result is not None
+    assert github.result.verdict == "partial"
+    assert github.post_kwargs["hidden_marker"] is None
+
+
+def test_initial_finish_fails_closed_when_coverage_is_missing_or_wrong(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_completed_run(tmp_path)
+    diff = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n+x\n"
+    (tmp_path / "diff.patch").write_text(diff, encoding="utf-8")
+    _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 1
+    result = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert result["verdict"] == "error"
+    assert "coverage" in result["incomplete_reason"]
+
+    envelope = {
+        "text": json.dumps(
+            {
+                "summary": "Swept everything.",
+                "issues": [],
+                "coverage": [{"path": "src/app.py", "findings": 0}],
+            }
+        ),
+        "stopReason": "EndTurn",
+    }
+    (tmp_path / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
+    assert cli.cmd_finish() == 0
+    assert github.result is not None
+    assert github.result.verdict == "clean"
+
+
+def test_verify_finish_rejects_new_findings_outside_the_embedded_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grok_pr_review.loop import LoopState
+
+    diff = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n+x\n"
+    envelope = {
+        "text": json.dumps(
+            {
+                "summary": "Found an unrelated issue.",
+                "issues": [
+                    {
+                        "severity": "bug",
+                        "path": "src/unchanged.py",
+                        "line": 3,
+                        "title": "Outside the fix",
+                        "detail": "This file was not changed by the verification diff.",
+                    }
+                ],
+                "resolutions": [],
+            }
+        ),
+        "stopReason": "EndTurn",
+    }
+    (tmp_path / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
+    (tmp_path / "grok-exit").write_text("0", encoding="utf-8")
+    (tmp_path / "diff.patch").write_text(diff, encoding="utf-8")
+    diff_bytes = len(diff.encode("utf-8"))
+    ReviewContext(
+        pr={"number": 7, "headRefOid": REVIEWED_SHA},
+        plan=DiffPlan("full-pr", "full-pr", None, REVIEWED_SHA, None),
+        truncated=False,
+        original_bytes=diff_bytes,
+        embedded_bytes=diff_bytes,
+        max_diff_kb=300,
+        loop=LoopState(
+            mode="verify",
+            round_number=2,
+            severity_floor="risk",
+            escalated=False,
+            retired=0,
+            prior_findings=(),
+        ),
+    ).write(tmp_path / "review-context.json")
+    _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 1
+    assert github.incomplete_result is not None
+    assert "outside the embedded diff" in (github.incomplete_result.incomplete_reason or "")
+
+
+def test_forced_verify_without_state_and_corrupted_ledgers_fail_visibly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head = "a" * 40
+    for name, value in {
+        "WORK": str(tmp_path / "work"),
+        "PR_NUMBER": "7",
+        "REVIEW_SCOPE": "latest-commit",
+        "MAX_DIFF_KB": "300",
+        "HEAD_SHA": head,
+        "GITHUB_REPOSITORY": "owner/repo",
+        "REVIEW_MODE": "verify",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+    collected = CollectedReview(
+        pr={"number": 7, "headRefOid": head},
+        plan=DiffPlan("latest-commit", "single-commit", None, head, None),
+        truncation=Truncation("diff --git a/a b/a\n+x\n", False, 22, 22, 300),
+    )
+    monkeypatch.setattr(cli, "collect_review_material", lambda **_kwargs: collected)
+
+    class EmptyHistory(PipelineFailureGitHub):
+        def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+            return []
+
+    github = EmptyHistory()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+    assert cli.main(["collect"]) == 2
+    assert github.comment is not None
+    assert "no prior review-loop state" in github.comment[1]
+
+    class CorruptedHistory(PipelineFailureGitHub):
+        def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+            return ["<!-- grok-review-ledger:v1:AAAA -->"]
+
+    monkeypatch.setenv("REVIEW_MODE", "auto")
+    monkeypatch.setenv("EVENT_ACTION", "synchronize")
+    corrupted = CorruptedHistory()
+    monkeypatch.setattr(cli, "_github", lambda: corrupted)
+    assert cli.main(["collect"]) == 2
+    assert corrupted.comment is not None
+    assert "corrupted" in corrupted.comment[1]
+
+
+def test_truncated_verify_push_escalates_even_below_the_line_threshold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grok_pr_review.loop import Ledger, LedgerFinding, encode_ledger
+
+    head = "a" * 40
+    work = tmp_path / "work"
+    for name, value in {
+        "WORK": str(work),
+        "PR_NUMBER": "7",
+        "REVIEW_SCOPE": "latest-commit",
+        "MAX_DIFF_KB": "300",
+        "HEAD_SHA": head,
+        "EVENT_ACTION": "synchronize",
+        "GITHUB_REPOSITORY": "owner/repo",
+        "VERIFY_ESCALATION_LINES": "500",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+
+    prior = encode_ledger(
+        Ledger(1, (LedgerFinding("r1-1", "bug", "src/app.py", 3, "Crash", "open"),)),
+        repo="owner/repo",
+        pr_number=7,
+    )
+
+    class LoopGitHub:
+        def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+            return [prior]
+
+        def list_finding_replies(self, _number: int) -> list[tuple[str, str, str]]:
+            return []
+
+        def list_recent_issue_comments(self, _number: int) -> list[tuple[str, str]]:
+            return []
+
+    monkeypatch.setattr(cli, "_github", LoopGitHub)
+    # A truncated diff with only 2 changed lines embedded: the original was huge.
+    collected = CollectedReview(
+        pr={"number": 7, "headRefOid": head},
+        plan=DiffPlan("latest-commit", "single-commit", None, head, None),
+        truncation=Truncation("diff --git a/a b/a\n+x\n+y\n", True, 999_999, 25, 300),
+    )
+    monkeypatch.setattr(cli, "collect_review_material", lambda **_kwargs: collected)
+
+    assert cli.cmd_collect() == 0
+    context = ReviewContext.read(work / "review-context.json")
+    assert context.loop is not None
+    assert context.loop.escalated is True
+    assert context.loop.severity_floor == "nit"
+    assert not (work / "model-override").exists()
+
+
+def test_finish_labels_the_review_with_the_model_that_actually_ran(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_completed_run(tmp_path)
+    (tmp_path / "model-override").write_text("grok-4-fast", encoding="utf-8")
+    _set_finish_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("MODEL", "grok-4.6")
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 0
+    assert github.post_kwargs["model"] == "grok-4-fast"
+
+
+def test_stateless_synchronize_fails_for_latest_commit_but_not_full_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head = "a" * 40
+    for name, value in {
+        "WORK": str(tmp_path / "work"),
+        "PR_NUMBER": "7",
+        "REVIEW_SCOPE": "latest-commit",
+        "MAX_DIFF_KB": "300",
+        "HEAD_SHA": head,
+        "GITHUB_REPOSITORY": "owner/repo",
+        "REVIEW_MODE": "auto",
+        "EVENT_ACTION": "synchronize",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+    collected = CollectedReview(
+        pr={"number": 7, "headRefOid": head},
+        plan=DiffPlan("latest-commit", "single-commit", None, head, None),
+        truncation=Truncation("diff --git a/a b/a\n+x\n", False, 22, 22, 300),
+    )
+    monkeypatch.setattr(cli, "collect_review_material", lambda **_kwargs: collected)
+
+    class EmptyHistory(PipelineFailureGitHub):
+        pass
+
+    github = EmptyHistory()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+    assert cli.main(["collect"]) == 2
+    assert github.comment is not None
+    assert "run an initial full-PR review" in github.comment[1]
+
+    # An initial round cannot use the same latest-commit scope: that would
+    # establish authoritative state without reviewing the full PR.
+    monkeypatch.setenv("REVIEW_MODE", "initial")
+    github.comment = None
+    assert cli.main(["collect"]) == 2
+    assert github.comment is not None
+    assert "initial review must use review_scope: full-pr" in github.comment[1]
+
+    # The same state-free synchronize is safe under full-pr scope: the
+    # "initial" round then genuinely covers the whole PR.
+    monkeypatch.setenv("REVIEW_SCOPE", "full-pr")
+    monkeypatch.setenv("REVIEW_MODE", "auto")
+    full = CollectedReview(
+        pr={"number": 7, "headRefOid": head},
+        plan=DiffPlan("full-pr", "full-pr", None, head, None),
+        truncation=Truncation("diff --git a/a b/a\n+x\n", False, 22, 22, 300),
+    )
+    monkeypatch.setattr(cli, "collect_review_material", lambda **_kwargs: full)
+    assert cli.main(["collect"]) == 0

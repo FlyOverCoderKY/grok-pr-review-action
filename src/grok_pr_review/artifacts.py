@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
+from grok_pr_review.config import SEVERITIES, Severity
+from grok_pr_review.loop import MAX_ROUNDS_TRACKED, LoopState, _decode_finding
 from grok_pr_review.scope import (
     CollectedReview,
     DiffKind,
@@ -32,9 +34,12 @@ class ReviewContext:
     original_bytes: int
     embedded_bytes: int
     max_diff_kb: int
+    loop: LoopState | None = None
 
     @classmethod
-    def from_collected(cls, collected: CollectedReview) -> ReviewContext:
+    def from_collected(
+        cls, collected: CollectedReview, loop: LoopState | None = None
+    ) -> ReviewContext:
         truncation = collected.truncation
         return cls(
             pr=collected.pr,
@@ -43,6 +48,7 @@ class ReviewContext:
             original_bytes=truncation.original_bytes,
             embedded_bytes=truncation.embedded_bytes,
             max_diff_kb=truncation.max_diff_kb,
+            loop=loop,
         )
 
     @classmethod
@@ -113,6 +119,7 @@ class ReviewContext:
             original_bytes=original_bytes,
             embedded_bytes=embedded_bytes,
             max_diff_kb=max_diff_kb,
+            loop=_loop_state(data.get("loop")),
         )
 
     @classmethod
@@ -134,6 +141,26 @@ class ReviewContext:
             raise ArtifactError(f"could not write {path.name}: {exc}") from exc
 
     def to_dict(self) -> dict[str, object]:
+        loop_value: dict[str, object] | None = None
+        if self.loop is not None:
+            loop_value = {
+                "mode": self.loop.mode,
+                "round": self.loop.round_number,
+                "severity_floor": self.loop.severity_floor,
+                "escalated": self.loop.escalated,
+                "retired": self.loop.retired,
+                "findings": [
+                    {
+                        "id": finding.id,
+                        "severity": finding.severity,
+                        "path": finding.path,
+                        "line": finding.line,
+                        "title": finding.title,
+                        "status": finding.status,
+                    }
+                    for finding in self.loop.prior_findings
+                ],
+            }
         return {
             "schema_version": SCHEMA_VERSION,
             "pr": self.pr,
@@ -150,6 +177,7 @@ class ReviewContext:
                 "embedded_bytes": self.embedded_bytes,
                 "max_diff_kb": self.max_diff_kb,
             },
+            "loop": loop_value,
         }
 
     def to_collected(self, diff: str) -> CollectedReview:
@@ -180,6 +208,48 @@ class ReviewContext:
             embedded_bytes=self.embedded_bytes,
             max_diff_kb=self.max_diff_kb,
         ).notice
+
+
+def _loop_state(value: object) -> LoopState | None:
+    if value is None:
+        return None
+    data = _object(value, "review context loop")
+    mode = data.get("mode")
+    if mode not in {"initial", "verify"}:
+        raise ArtifactError("loop.mode must be initial or verify")
+    round_number = data.get("round")
+    if (
+        isinstance(round_number, bool)
+        or not isinstance(round_number, int)
+        or not 1 <= round_number <= MAX_ROUNDS_TRACKED
+    ):
+        raise ArtifactError("loop.round must be a positive integer")
+    floor = data.get("severity_floor")
+    if floor not in SEVERITIES:
+        raise ArtifactError("loop.severity_floor must be nit, risk, or bug")
+    escalated = data.get("escalated")
+    if not isinstance(escalated, bool):
+        raise ArtifactError("loop.escalated must be a boolean")
+    retired = data.get("retired")
+    if isinstance(retired, bool) or not isinstance(retired, int) or retired < 0:
+        raise ArtifactError("loop.retired must be a nonnegative integer")
+    raw_findings = data.get("findings")
+    if not isinstance(raw_findings, list):
+        raise ArtifactError("loop.findings must be an array")
+    findings = []
+    for item in raw_findings:
+        finding = _decode_finding(item)
+        if finding is None:
+            raise ArtifactError("loop.findings contains an invalid finding")
+        findings.append(finding)
+    return LoopState(
+        mode=mode,
+        round_number=round_number,
+        severity_floor=cast(Severity, floor),
+        escalated=escalated,
+        retired=retired,
+        prior_findings=tuple(findings),
+    )
 
 
 def _object(value: object, name: str) -> dict[str, object]:

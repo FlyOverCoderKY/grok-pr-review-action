@@ -116,16 +116,33 @@ Until a `v1` tag exists, pin a commit SHA or the branch you merged.
 | `custom_instructions` | _empty_ | Extra prompt text (conventions, ignore rules), limited to 16,000 UTF-8 bytes. Never put secrets here. |
 | `status_comments` | `true` | Live “Grokking this…” comment. |
 | `max_diff_kb` | `300` | Embedded diff cap, with a truncation notice. |
-| `review_scope` | `full-pr` | `full-pr` \| `latest-commit`. |
+| `review_scope` | `full-pr` | `full-pr` \| `latest-commit`. Initial rounds require `full-pr`; `latest-commit` is for verification rounds. |
+| `review_mode` | `auto` | Loop position: `auto` (opened = initial round, synchronize = verify round), or force `initial` \| `verify`. |
+| `severity_schedule` | `nit,risk,bug` | Severity floor per round, comma-separated; the last entry repeats. Default: everything in round 1, bugs+risks in round 2, bugs only from round 3. |
+| `verify_model` | _empty_ | Optional cheaper model for verify rounds. |
+| `verify_effort` | _empty_ | Optional effort override for verify rounds. |
+| `verify_escalation_lines` | `500` | A verify push changing more lines than this (or one whose diff was truncated) gets a full-severity review with the primary model. |
+| `bot_login` | `github-actions[bot]` | The login the action posts reviews as; ledger state is only trusted from this author. Set it when `github_token` is a PAT or App token. |
 
 ## Outputs
 
 | Output | Meaning |
 | --- | --- |
 | `verdict` | `clean` \| `issues` \| `partial` \| `error` |
-| `issue_count` | Structured findings |
-| `bug_count` | Findings with `severity: bug` |
+| `issue_count` | Open findings after this round (carried-over plus new) |
+| `bug_count` | Open `severity: bug` findings after this round |
+| `round` | Review-loop round number this run performed |
 | `review_url` | Posted GitHub review, or the incomplete-review comment |
+
+## The review loop
+
+The action is built for an agentic PR loop: review → agent fixes → re-review, until clean.
+
+**Round 1 (initial, on `opened`)** is deliberately exhaustive and recall-biased. The prompt tells Grok its findings are adjudicated by an automated fixing agent, not read by a human, so it should report every issue it can name a failure scenario for — bugs, risks, and nits — sweep the diff repeatedly until a sweep finds nothing new, and account for every file in a coverage manifest. The manifest is enforced, not advisory: an initial review whose coverage does not account for every diff file — including renames, mode-only changes, and binary files — with per-file counts matching the reported findings, or that reports findings in files outside the embedded diff, is rejected as invalid output and fails the job. Expect the finding count to be front-loaded: a thorough round 1 is cheaper than five shallow rounds.
+
+**Rounds 2+ (verify, on `synchronize`)** are convergence rounds. Under `latest-commit` scope the verification diff spans everything **since the last published review** (from the SHA recorded in the ledger to the current head), not just this push's webhook range — so concurrent pushes completing out of order can never leave a commit range unreviewed. The bot reads its own prior review, re-lists the open findings, and asks Grok to verdict each one — `fixed`, `not_fixed`, `fixed_incorrectly`, or `disputed` — using the fix commits and the fixing agent's comment-thread replies as evidence. A reasoned rebuttal settles a finding as disputed; it is never re-raised without new evidence. New findings are accepted only in code the fix commits touched, at or above the round's severity floor from `severity_schedule` — so by round 3 (default) a nit about comment phrasing is structurally unreportable. A verify push changing more than `verify_escalation_lines` lines — or one whose diff exceeded `max_diff_kb` and was truncated — escalates to a full-severity review automatically, because a massive mid-loop change means the loop is off the rails. When the floor rises, still-open lower-severity findings from earlier rounds are retired without a disposition — by design: by round 3 an unfixed nit is noise, not signal — so "open findings" means unresolved findings at or above the current floor.
+
+State lives in a hidden, base64-encoded ledger inside the bot's own review bodies — the fixing agent needs no bot-specific protocol, so this action coexists with other review bots. The ledger is only trusted from reviews authored by `bot_login` and is bound to the repository, PR, and reviewed commit, so other reviewers cannot forge loop state. State recovery fails closed: if prior reviews cannot be read, if the newest ledger marker is corrupted, or if a `latest-commit` synchronize run finds no prior state at all, the run fails visibly instead of silently resetting to round 1 and discarding carried findings — only an explicit `review_mode: initial` with `review_scope: full-pr` (or a state-free `full-pr` collection) starts fresh. The ledger preserves every open finding or fails the run: settled disputed findings may be trimmed to fit the marker's size limits, but unresolved findings are never silently dropped. Any partial run — including a stale, truncated, or history-fallback review — posts its findings and warning but never publishes ledger state; the previous complete marker remains the retry boundary. Dispositions come only from commits and ordinary GitHub comment replies. New findings in every round are validated against the embedded diff's paths. `issue_count`/`bug_count` outputs report **open** findings including unfixed carry-overs, so an agent loop should iterate until `bug_count` is `0` (or `issue_count`, if it chases risks too). Use `verify_model`/`verify_effort` to run verify rounds on a cheaper tier — verifying a fix is a much easier task than finding the issue was; the posted review is labeled with the model that actually ran. Forcing `review_mode: initial` with `review_scope: full-pr` (or any `workflow_dispatch` run using that scope) resets the loop with a fresh exhaustive review. Add a `concurrency` group with `cancel-in-progress: true` to avoid paying for superseded runs.
 
 Grok runs headless with `--prompt-file` and JSON output. Tools are allowlisted to `read_file`, `grep`, and `list_dir`. There is no shell tool. `--yolo` only auto-approves those read-only tools.
 
