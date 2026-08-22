@@ -295,9 +295,25 @@ unset GROK_APPARMOR_EXTRA_PROFILES_DIR GROK_APPARMOR_D_DIR
 
 stub="$test_root/grok"
 args_file="$test_root/args"
+prompt_file_arg="$test_root/prompt-file-arg"
+prompt_file_contents="$test_root/prompt-file-contents"
 cat > "$stub" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$@" > "$STUB_ARGS_FILE"
+args=("$@")
+prompt_path=""
+for ((i = 0; i < $#; i++)); do
+  if [[ "${args[i]}" == "--prompt-file" ]]; then
+    prompt_path="${args[i + 1]}"
+    break
+  fi
+done
+printf '%s\n' "$prompt_path" > "$STUB_PROMPT_PATH_FILE"
+if [[ -z "$prompt_path" || ! -f "$prompt_path" ]]; then
+  echo "stub: --prompt-file is missing or unreadable: ${prompt_path:-<none>}" >&2
+  exit 1
+fi
+cat -- "$prompt_path" > "$STUB_PROMPT_CONTENTS_FILE"
 printf '%s\n' '{"text":"{\"summary\":\"ok\",\"issues\":[]}","stopReason":"EndTurn"}'
 echo "stub stderr" >&2
 exit "${STUB_EXIT_CODE:-0}"
@@ -306,20 +322,39 @@ chmod +x "$stub"
 
 mkdir -p "$test_root/workspace"
 printf '%s\n' prompt > "$test_root/prompt.md"
-export MODEL="grok-test" EFFORT="low" MAX_TURNS="12" STUB_ARGS_FILE="$args_file"
+export MODEL="grok-test" EFFORT="low" MAX_TURNS="12"
+export STUB_ARGS_FILE="$args_file"
+export STUB_PROMPT_PATH_FILE="$prompt_file_arg"
+export STUB_PROMPT_CONTENTS_FILE="$prompt_file_contents"
 bash "$repo_root/scripts/run-grok.sh" \
   "$stub" "$test_root/prompt.md" "$test_root/workspace" \
   "$test_root/output.json" "$test_root/stderr.log" "$test_root/exit"
 [[ "$(cat "$test_root/exit")" == "0" ]]
 grep -q -- '--sandbox' "$args_file"
+grep -qx -- 'strict' "$args_file"
 grep -q -- '--no-subagents' "$args_file"
 grep -q -- "$test_root/workspace" "$args_file"
 grep -q -- 'EndTurn' "$test_root/output.json"
+sandbox_prompt="$test_root/workspace/.grok-pr-review/prompt.md"
+[[ "$(cat "$prompt_file_arg")" == "$sandbox_prompt" ]]
+case "$(cat "$prompt_file_arg")" in
+  "$test_root/workspace"/*) ;;
+  *)
+    echo "prompt-file path is not under the review cwd" >&2
+    exit 1
+    ;;
+esac
+[[ "$(cat "$prompt_file_arg")" != "$test_root/prompt.md" ]]
+[[ "$(cat "$prompt_file_contents")" == "prompt" ]]
+[[ -f "$test_root/prompt.md" ]]
+[[ ! -e "$test_root/workspace/.grok-pr-review" ]]
 
 STUB_EXIT_CODE=7 bash "$repo_root/scripts/run-grok.sh" \
   "$stub" "$test_root/prompt.md" "$test_root/workspace" \
   "$test_root/output-failed.json" "$test_root/stderr-failed.log" "$test_root/exit-failed"
 [[ "$(cat "$test_root/exit-failed")" == "7" ]]
+[[ "$(cat "$prompt_file_arg")" == "$sandbox_prompt" ]]
+[[ ! -e "$test_root/workspace/.grok-pr-review" ]]
 
 bad="$test_root/not-owned"
 mkdir -p "$bad"

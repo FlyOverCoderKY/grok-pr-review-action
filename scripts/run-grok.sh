@@ -21,8 +21,26 @@ if [[ -n "${EFFORT:-}" ]]; then
   extra_args+=(--effort "$EFFORT")
 fi
 
+# --sandbox strict / bwrap only allows reading inside --cwd. The action writes
+# prompt.md next to the isolated workspace, so copy it under review_cwd first.
+sandbox_prompt_dir="$review_cwd/.grok-pr-review"
+sandbox_prompt="$sandbox_prompt_dir/prompt.md"
+case "$sandbox_prompt" in
+  "$review_cwd"/*) ;;
+  *)
+    echo "error: sandbox prompt path is not under the review cwd" >&2
+    exit 1
+    ;;
+esac
+mkdir -p -- "$sandbox_prompt_dir"
+cp -- "$prompt" "$sandbox_prompt"
+cleanup_sandbox_prompt() {
+  rm -rf -- "$sandbox_prompt_dir"
+}
+trap cleanup_sandbox_prompt EXIT
+
 set +e
-"$grok" --prompt-file "$prompt" \
+"$grok" --prompt-file "$sandbox_prompt" \
   --output-format json \
   --yolo \
   --sandbox strict \
