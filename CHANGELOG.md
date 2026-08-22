@@ -7,6 +7,7 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 ### Fixed
 
 - Install `bubblewrap` (`bwrap`) on Linux before invoking the Grok CLI so GitHub-hosted Ubuntu runners can enforce the strict sandbox deny list. If `bwrap` is already present the install is skipped; if it cannot be installed the action still fails closed. Self-hosted Linux runners must provide `bwrap` or allow `sudo apt-get install -y bubblewrap`. There is no production switch to disable the sandbox.
+- Enable bubblewrap user namespaces on Ubuntu 24.04+ GitHub-hosted runners after `bwrap` is present. Ubuntu's `kernel.apparmor_restrict_unprivileged_userns=1` blocks unprivileged uid maps (`bwrap: setting up uid map: Permission denied`). The action loads `bwrap-userns-restrict` when available, otherwise relaxes the restriction for the job, then probes `bwrap --unshare-user`. There is still no production switch to disable `--sandbox strict`. Prep for v1.0.2.
 
 ## [1.0.0] - 2026-08-22
 
