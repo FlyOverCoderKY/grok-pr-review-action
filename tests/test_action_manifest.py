@@ -61,3 +61,20 @@ def test_readme_explains_latest_commit_and_auth() -> None:
     assert "Operational errors always fail" in text
     assert "## The review loop" in text
     assert "severity floor" in text
+    assert "bot_login" in text
+    assert "github-actions[bot]" in text
+    assert "only trusted from reviews authored by" in text
+    assert "prompt-cache miss" in text
+    assert "uses: FlyOverCoderKY/grok-pr-review-action@v1" in text
+    assert "@v1.0.0" in text
+
+
+def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
+    text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert text.index("## Unreleased") < text.index("## [1.0.0] - 2026-08-22")
+    assert "coverage manifest" in text
+    assert "severity_schedule" in text
+    assert "bot_login" in text
+    assert "fixed_incorrectly" in text
+    assert "verify_model" in text
+    assert "review_mode" in text
