@@ -11,15 +11,23 @@ from typing import Any
 from grok_pr_review.auth import require_xai_api_key, write_grok_config
 from grok_pr_review.github import GitHubCli
 from grok_pr_review.prompt import PromptContext, build_prompt
-from grok_pr_review.result import parse_grok_output, should_fail_job
+from grok_pr_review.result import (
+    ReviewResult,
+    mark_partial,
+    neutralize_mentions,
+    parse_grok_output,
+    should_fail_job,
+)
 from grok_pr_review.scope import (
     DiffPlan,
     DiffRequest,
     GhError,
     Truncation,
     collect_review_material,
+    normalize_sha,
     parse_scope,
 )
+from grok_pr_review.workspace import prepare_review_workspace
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -28,6 +36,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("check-auth", help="Fail closed when XAI_API_KEY is empty")
     sub.add_parser("write-config", help="Write GROK_HOME/config.toml for api.x.ai")
     sub.add_parser("collect", help="Fetch PR metadata and the scoped diff")
+    sub.add_parser("prepare-workspace", help="Create an inert read-only review workspace")
     sub.add_parser("prompt", help="Write prompt.md from collected artifacts")
     sub.add_parser("start-status", help="Post or update the live status comment")
     sub.add_parser("finish", help="Parse Grok output and post the review")
@@ -37,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
         "check-auth": cmd_check_auth,
         "write-config": cmd_write_config,
         "collect": cmd_collect,
+        "prepare-workspace": cmd_prepare_workspace,
         "prompt": cmd_prompt,
         "start-status": cmd_start_status,
         "finish": cmd_finish,
@@ -140,6 +150,28 @@ def cmd_prompt() -> int:
     return 0
 
 
+def cmd_prepare_workspace() -> int:
+    work = _work_dir()
+    source = Path(_require_env("SOURCE_WORKSPACE"))
+    destination = work / "workspace"
+    preparation = prepare_review_workspace(source, destination)
+    (work / "workspace.json").write_text(
+        json.dumps(
+            {
+                "files_copied": preparation.files_copied,
+                "excluded_paths": preparation.excluded_paths,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(
+        f"Prepared inert review workspace with {preparation.files_copied} files "
+        f"({len(preparation.excluded_paths)} control or symlink paths excluded)."
+    )
+    return 0
+
+
 def cmd_start_status() -> int:
     if not _truthy(os.environ.get("STATUS_COMMENTS", "true")):
         return 0
@@ -169,9 +201,15 @@ def cmd_finish() -> int:
     raw = _read_optional(work / "grok-output.json")
     exit_code = _read_exit(work / "grok-exit")
     result = parse_grok_output(raw, exit_code=exit_code)
+    scope_data = _read_json_object(work / "scope.json")
+    if bool(scope_data.get("truncated")):
+        notice = scope_data.get("truncation_notice")
+        reason = notice if isinstance(notice, str) and notice.strip() else "The diff was truncated."
+        result = mark_partial(result, reason)
 
     github = _github()
     review_url = ""
+    posting_failed = False
     try:
         if result.incomplete:
             review_url = github.post_incomplete(
@@ -179,8 +217,23 @@ def cmd_finish() -> int:
             )
             print(result.incomplete_reason or "Review incomplete.")
         else:
-            pr = json.loads((work / "pr.json").read_text(encoding="utf-8"))
-            commit_id = str(pr.get("headRefOid") or "")
+            pr = _read_json_object(work / "pr.json")
+            commit_id = normalize_sha(_maybe_str(scope_data.get("to_sha")))
+            if commit_id is None:
+                commit_id = normalize_sha(_maybe_str(pr.get("headRefOid")))
+            if commit_id is None:
+                raise GhError("reviewed commit SHA is missing")
+
+            live_pr = github.pr_view(pr_number)
+            live_head = normalize_sha(_maybe_str(live_pr.get("headRefOid")))
+            if live_head is None:
+                raise GhError("current PR head SHA is missing")
+            if live_head != commit_id:
+                result = mark_partial(
+                    result,
+                    "The PR head advanced after this diff was collected. "
+                    f"This review is pinned to commit {commit_id[:12]}.",
+                )
             review_url = github.post_review(
                 pr_number,
                 commit_id,
@@ -190,7 +243,16 @@ def cmd_finish() -> int:
                 run_url=run_url,
             )
     except GhError as exc:
-        print(f"Failed to post PR feedback: {exc}")
+        reason = f"Failed to post PR feedback: {exc}"
+        print(reason)
+        result = ReviewResult(
+            verdict="error",
+            summary=result.summary,
+            issues=result.issues,
+            incomplete_reason=reason,
+            stop_reason=result.stop_reason,
+        )
+        posting_failed = True
 
     _update_status(github, work, pr_number, result, scope, review_url)
     _write_outputs(result, review_url)
@@ -202,12 +264,15 @@ def cmd_finish() -> int:
                 "bug_count": result.bug_count,
                 "review_url": review_url,
                 "incomplete_reason": result.incomplete_reason,
+                "partial_reason": result.partial_reason,
             },
             indent=2,
         ),
         encoding="utf-8",
     )
     print(f"verdict={result.verdict} issues={result.issue_count} bugs={result.bug_count}")
+    if posting_failed:
+        return 1
     if should_fail_job(fail_on, result):
         print(f"Failing the job because fail_on={fail_on}.")
         return 1
@@ -230,7 +295,9 @@ def _update_status(
     if review_url:
         summary += f"\n\n{review_url}"
     if result.incomplete_reason:
-        summary += f"\n\n{result.incomplete_reason}"
+        summary += f"\n\n{neutralize_mentions(result.incomplete_reason)}"
+    if result.partial_reason:
+        summary += f"\n\nPartial review: {neutralize_mentions(result.partial_reason)}"
     try:
         github.upsert_status_comment(pr_number, summary, comment_id)
     except GhError as exc:
@@ -336,6 +403,16 @@ def _read_exit(path: Path) -> int:
     if raw.isdigit() or (raw.startswith("-") and raw[1:].isdigit()):
         return int(raw)
     return 0
+
+
+def _read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Could not read {path.name}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise SystemExit(f"Could not read {path.name}: expected a JSON object")
+    return loaded
 
 
 def _truthy(value: str) -> bool:

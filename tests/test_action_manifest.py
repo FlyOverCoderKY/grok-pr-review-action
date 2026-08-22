@@ -18,6 +18,14 @@ def test_action_yml_uses_xai_api_key_not_supergrok() -> None:
     assert "SuperGrok" not in text
     assert "grok login" not in text
     assert "always()" in text or "if: ${{ always() }}" in text
+    assert "--sandbox strict" in text
+    assert "--no-subagents" in text
+    assert "prepare-workspace" in text
+    assert "grok-1.0.5" not in text  # URL is assembled from the separately pinned version.
+    assert 'GROK_VERSION="1.0.5"' in text
+    assert "sha256sum --check" in text
+    assert 'rm -f "$HOME/.grok/' not in text
+    assert 'rm -rf "$HOME/.grok' not in text
 
 
 def test_readme_explains_latest_commit_and_auth() -> None:
