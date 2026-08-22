@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
+from grok_pr_review.config import parse_fail_on
+
 Verdict = Literal["clean", "issues", "partial", "error"]
-FailOn = Literal["never", "bugs", "any"]
 MAX_TURNS_REASONS = {"max_turn", "max_turn_requests", "max_turns", "max_turns_reached"}
 SUCCESS_REASONS = {"end_turn"}
 MAX_ISSUES = 100
@@ -17,10 +18,11 @@ MAX_SUMMARY_LENGTH = 8_000
 MAX_TITLE_LENGTH = 300
 MAX_DETAIL_LENGTH = 8_000
 MAX_PATH_LENGTH = 1_000
-MAX_REVIEW_BODY_BYTES = 60_000
+MAX_GITHUB_BODY_BYTES = 60_000
+TARGET_GITHUB_BODY_BYTES = 58_000
 
 _BODY_TRUNCATION_NOTICE = (
-    "\n\n> [!WARNING]\n> Some finding detail was omitted to stay within GitHub's review body limit."
+    "\n\n> [!WARNING]\n> Some text was omitted to stay within GitHub's body limit."
 )
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
@@ -61,21 +63,16 @@ class ReviewResult:
         return self.verdict == "error"
 
 
-def parse_fail_on(value: str) -> FailOn:
-    chosen = value.strip().lower() or "never"
-    if chosen not in {"never", "bugs", "any"}:
-        raise ValueError("fail_on must be never, bugs, or any")
-    return chosen  # type: ignore[return-value]
-
-
 def should_fail_job(fail_on: str, result: ReviewResult) -> bool:
-    """fail_on=never never red-Xs the job for findings or an incomplete review."""
+    """Operational errors always fail; fail_on controls completed review findings."""
     policy = parse_fail_on(fail_on)
+    if result.verdict == "error":
+        return True
     if policy == "never":
         return False
     if policy == "bugs":
         return result.bug_count > 0
-    return result.verdict in {"issues", "partial", "error"} or result.issue_count > 0
+    return result.verdict in {"issues", "partial"} or result.issue_count > 0
 
 
 def parse_grok_output(raw: str, *, exit_code: int = 0) -> ReviewResult:
@@ -171,6 +168,17 @@ def mark_partial(result: ReviewResult, reason: str) -> ReviewResult:
 
 
 def format_review_body(result: ReviewResult, *, scope: str, model: str, run_url: str) -> str:
+    return format_review_body_parts(result, scope=scope, model=model, run_url=run_url)[0]
+
+
+def format_review_body_parts(
+    result: ReviewResult,
+    *,
+    scope: str,
+    model: str,
+    run_url: str,
+) -> list[str]:
+    """Render every finding across bounded GitHub bodies without dropping detail."""
     heading = "Grok PR review"
     if result.verdict == "clean":
         heading += " — clean"
@@ -178,7 +186,7 @@ def format_review_body(result: ReviewResult, *, scope: str, model: str, run_url:
         heading += f" — {result.issue_count} issue(s)"
     elif result.verdict == "partial":
         heading += f" — partial ({result.issue_count} issue(s))"
-    lines = [
+    first_lines = [
         f"## {heading}",
         "",
         neutralize_mentions(result.summary.strip()) or "Review completed.",
@@ -188,25 +196,32 @@ def format_review_body(result: ReviewResult, *, scope: str, model: str, run_url:
         f"- Issues: {result.issue_count} ({result.bug_count} bug-severity)",
     ]
     if result.partial_reason:
-        lines.extend(["", "> [!WARNING]", f"> {neutralize_mentions(result.partial_reason)}"])
+        first_lines.extend(["", "> [!WARNING]", f"> {neutralize_mentions(result.partial_reason)}"])
     if run_url:
-        lines.append(f"- Workflow run: {run_url}")
-    if result.issues:
-        lines.extend(["", "### Findings", ""])
-        for issue in result.issues:
-            location = issue.path or "(no path)"
-            if issue.line is not None:
-                location = f"{location}:{issue.line}"
-            lines.append(
-                f"- **{neutralize_mentions(issue.title)}** (`{issue.severity}`) — "
-                f"`{neutralize_mentions(location)}`"
-            )
-            lines.append(f"  {neutralize_mentions(issue.detail)}")
-    body = "\n".join(lines).rstrip() + "\n"
-    return _limit_review_body(body)
+        first_lines.append(f"- Workflow run: {run_url}")
+    if not result.issues:
+        return [limit_github_body("\n".join(first_lines).rstrip() + "\n")]
+
+    first_lines.extend(["", "### Findings", ""])
+    return _chunk_issue_bodies(
+        first_lines,
+        result.issues,
+        continuation_lines=["## Grok PR review — continued", "", "### Findings", ""],
+    )
 
 
 def format_incomplete_comment(result: ReviewResult, *, scope: str, model: str, run_url: str) -> str:
+    return format_incomplete_comment_parts(result, scope=scope, model=model, run_url=run_url)[0]
+
+
+def format_incomplete_comment_parts(
+    result: ReviewResult,
+    *,
+    scope: str,
+    model: str,
+    run_url: str,
+) -> list[str]:
+    """Render an incomplete result, retaining findings recovered before the failure."""
     reason = result.incomplete_reason or "The review did not finish with structured findings."
     lines = [
         "## Grok review incomplete",
@@ -221,10 +236,68 @@ def format_incomplete_comment(result: ReviewResult, *, scope: str, model: str, r
         f"- Verdict: `{result.verdict}`",
     ]
     if result.stop_reason:
-        lines.append(f"- Grok stop reason: `{result.stop_reason}`")
+        lines.append(f"- Grok stop reason: `{_inline_code(result.stop_reason)}`")
     if run_url:
         lines.append(f"- Workflow run: {run_url}")
+    if not result.issues:
+        return [limit_github_body("\n".join(lines).rstrip() + "\n")]
+    lines.extend(["", "### Findings recovered before the failure", ""])
+    return _chunk_issue_bodies(
+        lines,
+        result.issues,
+        continuation_lines=[
+            "## Grok incomplete review — continued",
+            "",
+            "### Findings recovered before the failure",
+            "",
+        ],
+    )
+
+
+def format_pipeline_failure_comment(*, stage: str, reason: str, run_url: str) -> str:
+    """Visible PR comment for a pipeline step that failed before Grok could run."""
+    lines = [
+        "## Grok review incomplete",
+        "",
+        f"The review pipeline failed during {stage}, before Grok could run: "
+        f"{neutralize_mentions(reason)}",
+        "",
+        "This is not a silent failure. Re-run the workflow once the underlying "
+        "problem is resolved.",
+    ]
+    if run_url:
+        lines.extend(["", f"- Workflow run: {run_url}"])
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _chunk_issue_bodies(
+    first_lines: list[str],
+    issues: list[Issue],
+    *,
+    continuation_lines: list[str],
+) -> list[str]:
+    part_lines: list[list[str]] = []
+    current = first_lines
+    prefix_length = len(current)
+    for issue in issues:
+        block = _format_issue_block(issue)
+        candidate = "\n".join([*current, *block]).rstrip() + "\n"
+        if len(candidate.encode("utf-8")) > TARGET_GITHUB_BODY_BYTES and (
+            len(current) > prefix_length or not part_lines
+        ):
+            part_lines.append(current)
+            current = list(continuation_lines)
+            prefix_length = len(current)
+        current.extend(block)
+    part_lines.append(current)
+
+    total = len(part_lines)
+    bodies: list[str] = []
+    for index, lines in enumerate(part_lines, start=1):
+        if total > 1:
+            lines = [*lines, "", f"_Part {index} of {total}; all findings are preserved._"]
+        bodies.append(limit_github_body("\n".join(lines).rstrip() + "\n"))
+    return bodies
 
 
 def inline_review_comments(result: ReviewResult) -> list[dict[str, Any]]:
@@ -401,17 +474,32 @@ def _valid_review_path(value: str) -> bool:
     return not parsed.is_absolute() and all(part not in {"", ".", ".."} for part in parsed.parts)
 
 
-def _limit_review_body(body: str) -> str:
+def _format_issue_block(issue: Issue) -> list[str]:
+    location = issue.path or "(no path)"
+    if issue.line is not None:
+        location = f"{location}:{issue.line}"
+    return [
+        f"- **{neutralize_mentions(issue.title)}** (`{issue.severity}`) — "
+        f"`{neutralize_mentions(location)}`",
+        f"  {neutralize_mentions(issue.detail)}",
+    ]
+
+
+def limit_github_body(body: str) -> str:
     encoded = body.encode("utf-8")
-    if len(encoded) <= MAX_REVIEW_BODY_BYTES:
+    if len(encoded) <= MAX_GITHUB_BODY_BYTES:
         return body
 
     suffix = (_BODY_TRUNCATION_NOTICE + "\n").encode("utf-8")
-    prefix = encoded[: MAX_REVIEW_BODY_BYTES - len(suffix)].decode("utf-8", errors="ignore")
+    prefix = encoded[: MAX_GITHUB_BODY_BYTES - len(suffix)].decode("utf-8", errors="ignore")
     last_newline = prefix.rfind("\n")
     if last_newline >= max(0, len(prefix) - 2_000):
         prefix = prefix[:last_newline]
     return prefix.rstrip() + suffix.decode("utf-8")
+
+
+def _inline_code(value: str) -> str:
+    return neutralize_mentions(value).replace("`", "'").replace("\r", " ").replace("\n", " ")
 
 
 def neutralize_mentions(value: str) -> str:

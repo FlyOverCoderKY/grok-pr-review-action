@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 
 from grok_pr_review.result import (
-    MAX_REVIEW_BODY_BYTES,
+    MAX_GITHUB_BODY_BYTES,
     Issue,
     ReviewResult,
     format_incomplete_comment,
+    format_incomplete_comment_parts,
     format_review_body,
+    format_review_body_parts,
     mark_partial,
     parse_grok_output,
     should_fail_job,
@@ -125,13 +127,13 @@ def test_max_turns_is_incomplete_error() -> None:
     assert "max_turns" in result.incomplete_reason
 
 
-def test_fail_on_never_does_not_fail_for_issues_or_errors() -> None:
+def test_operational_errors_always_fail_and_policy_only_controls_findings() -> None:
     issues = parse_grok_output(json.dumps({"text": json.dumps(FINDINGS), "stopReason": "end_turn"}))
     error = ReviewResult(verdict="error", summary="", incomplete_reason="no JSON")
     assert should_fail_job("never", issues) is False
-    assert should_fail_job("never", error) is False
+    assert should_fail_job("never", error) is True
     assert should_fail_job("bugs", issues) is True
-    assert should_fail_job("bugs", error) is False
+    assert should_fail_job("bugs", error) is True
     assert should_fail_job("any", issues) is True
     assert should_fail_job("any", error) is True
 
@@ -169,7 +171,7 @@ def test_partial_review_is_visible_and_neutralizes_mentions() -> None:
     assert "@\u200bsecurity" in body
 
 
-def test_review_body_is_capped_by_aggregate_utf8_size() -> None:
+def test_review_bodies_are_capped_without_omitting_validated_findings() -> None:
     result = ReviewResult(
         verdict="issues",
         summary="🔍" * 8_000,
@@ -186,10 +188,51 @@ def test_review_body_is_capped_by_aggregate_utf8_size() -> None:
         stop_reason="EndTurn",
     )
 
-    body = format_review_body(result, scope="full-pr", model="grok-4.6", run_url="")
+    bodies = format_review_body_parts(result, scope="full-pr", model="grok-4.6", run_url="")
+    aggregate = "\n".join(bodies)
 
-    assert len(body.encode("utf-8")) <= MAX_REVIEW_BODY_BYTES
-    assert "Some finding detail was omitted" in body
+    assert len(bodies) > 1
+    assert all(len(body.encode("utf-8")) <= MAX_GITHUB_BODY_BYTES for body in bodies)
+    for index in range(8):
+        assert f"Finding {index}" in aggregate
+        assert f"src/file_{index}.py" in aggregate
+    assert "Some text was omitted" not in aggregate
+    assert format_review_body(result, scope="full-pr", model="grok-4.6", run_url="") == bodies[0]
+
+
+def test_incomplete_bodies_preserve_findings_and_bound_untrusted_text() -> None:
+    result = ReviewResult(
+        verdict="error",
+        summary="",
+        incomplete_reason="failed @maintainers",
+        issues=[
+            Issue("risk", f"src/file_{index}.py", index + 1, f"Finding {index}", "x" * 8_000)
+            for index in range(8)
+        ],
+        stop_reason="bad`reason\nnext",
+    )
+
+    bodies = format_incomplete_comment_parts(result, scope="full-pr", model="grok-4.6", run_url="")
+    aggregate = "\n".join(bodies)
+
+    assert all(len(body.encode("utf-8")) <= MAX_GITHUB_BODY_BYTES for body in bodies)
+    assert "@\u200bmaintainers" in aggregate
+    assert "bad'reason next" in aggregate
+    for index in range(8):
+        assert f"Finding {index}" in aggregate
+
+
+def test_incomplete_comment_caps_a_huge_runtime_error() -> None:
+    result = ReviewResult(
+        verdict="error",
+        summary="",
+        incomplete_reason="🔍" * 20_000,
+    )
+
+    body = format_incomplete_comment(result, scope="full-pr", model="grok-4.6", run_url="")
+
+    assert len(body.encode("utf-8")) <= MAX_GITHUB_BODY_BYTES
+    assert "Some text was omitted" in body
 
 
 def test_review_body_limit_does_not_change_normal_reviews() -> None:

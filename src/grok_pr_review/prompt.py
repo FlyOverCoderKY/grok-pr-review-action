@@ -5,9 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from grok_pr_review.config import parse_custom_instructions, parse_roast_level
 from grok_pr_review.scope import CollectedReview, DiffPlan, Truncation
-
-ROAST_LEVELS = ("professional", "playful", "savage", "diabolical")
 
 _ROAST_GUIDANCE = {
     "professional": "Be precise, respectful, and specific. No jokes or dunking.",
@@ -24,6 +23,7 @@ class PromptContext:
     truncation: Truncation
     roast_level: str
     custom_instructions: str
+    allow_unprofessional_tone: bool = False
 
 
 def build_prompt_from_collected(
@@ -31,6 +31,7 @@ def build_prompt_from_collected(
     *,
     roast_level: str,
     custom_instructions: str,
+    allow_unprofessional_tone: bool = False,
 ) -> str:
     return build_prompt(
         PromptContext(
@@ -39,14 +40,16 @@ def build_prompt_from_collected(
             truncation=collected.truncation,
             roast_level=roast_level,
             custom_instructions=custom_instructions,
+            allow_unprofessional_tone=allow_unprofessional_tone,
         )
     )
 
 
 def build_prompt(context: PromptContext) -> str:
-    roast = context.roast_level.strip().lower() or "professional"
-    if roast not in ROAST_LEVELS:
-        roast = "professional"
+    roast = parse_roast_level(
+        context.roast_level,
+        allow_unprofessional=context.allow_unprofessional_tone,
+    )
 
     pr = context.pr
     plan = context.plan
@@ -102,7 +105,7 @@ def build_prompt(context: PromptContext) -> str:
         ]
     )
 
-    custom = context.custom_instructions.strip()
+    custom = parse_custom_instructions(context.custom_instructions)
     if custom:
         lines.extend(["## Custom instructions", "", custom, ""])
 

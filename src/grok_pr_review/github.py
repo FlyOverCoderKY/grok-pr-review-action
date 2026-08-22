@@ -11,9 +11,10 @@ from typing import Any
 
 from grok_pr_review.result import (
     ReviewResult,
-    format_incomplete_comment,
-    format_review_body,
+    format_incomplete_comment_parts,
+    format_review_body_parts,
     inline_review_comments,
+    limit_github_body,
 )
 from grok_pr_review.scope import GhError
 
@@ -21,9 +22,16 @@ STATUS_MARKER = "<!-- grok-pr-review-action-status -->"
 
 
 class GitHubCli:
-    def __init__(self, repo: str, env: dict[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        repo: str,
+        env: dict[str, str] | None = None,
+        *,
+        timeout_seconds: int = 120,
+    ) -> None:
         self.repo = repo
         self.env = os.environ.copy() if env is None else dict(env)
+        self.timeout_seconds = timeout_seconds
 
     def pr_view(self, number: int) -> dict[str, object]:
         raw = self._run(
@@ -89,7 +97,7 @@ class GitHubCli:
         return None
 
     def upsert_status_comment(self, pr_number: int, body: str, comment_id: int | None) -> int:
-        text = f"{STATUS_MARKER}\n{body}"
+        text = limit_github_body(f"{STATUS_MARKER}\n{body}")
         if comment_id is None:
             raw = self._api(
                 [
@@ -128,6 +136,7 @@ class GitHubCli:
         return ident
 
     def post_issue_comment(self, pr_number: int, body: str) -> str:
+        body = limit_github_body(body)
         raw = self._api(
             [
                 "--method",
@@ -151,7 +160,8 @@ class GitHubCli:
         model: str,
         run_url: str,
     ) -> str:
-        body = format_review_body(result, scope=scope, model=model, run_url=run_url)
+        bodies = format_review_body_parts(result, scope=scope, model=model, run_url=run_url)
+        body = bodies[0]
         comments = inline_review_comments(result)
         payload: dict[str, Any] = {
             "commit_id": commit_id,
@@ -161,7 +171,7 @@ class GitHubCli:
         if comments:
             payload["comments"] = comments
         try:
-            return self._submit_review(pr_number, payload)
+            review_url = self._submit_review(pr_number, payload)
         except GhError:
             if "comments" not in payload:
                 raise
@@ -170,7 +180,10 @@ class GitHubCli:
                 "body": body,
                 "event": "COMMENT",
             }
-            return self._submit_review(pr_number, fallback)
+            review_url = self._submit_review(pr_number, fallback)
+        for continuation in bodies[1:]:
+            self.post_issue_comment(pr_number, continuation)
+        return review_url
 
     def post_incomplete(
         self,
@@ -181,8 +194,11 @@ class GitHubCli:
         model: str,
         run_url: str,
     ) -> str:
-        body = format_incomplete_comment(result, scope=scope, model=model, run_url=run_url)
-        return self.post_issue_comment(pr_number, body)
+        bodies = format_incomplete_comment_parts(result, scope=scope, model=model, run_url=run_url)
+        first_url = self.post_issue_comment(pr_number, bodies[0])
+        for continuation in bodies[1:]:
+            self.post_issue_comment(pr_number, continuation)
+        return first_url
 
     def _submit_review(self, pr_number: int, payload: dict[str, Any]) -> str:
         raw = self._api(
@@ -207,14 +223,22 @@ class GitHubCli:
 
     def _exec(self, argv: list[str], stdin: str | None = None) -> str:
         # argv is passed directly and is never interpreted by a shell.
-        completed = subprocess.run(  # nosec B603
-            argv,
-            check=False,
-            capture_output=True,
-            text=True,
-            env=self.env,
-            input=stdin,
-        )
+        try:
+            completed = subprocess.run(  # nosec B603
+                argv,
+                check=False,
+                capture_output=True,
+                text=True,
+                env=self.env,
+                input=stdin,
+                timeout=self.timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as exc:
+            operation = " ".join(argv[:2])
+            raise GhError(f"{operation} timed out after {self.timeout_seconds} seconds") from exc
+        except OSError as exc:
+            operation = " ".join(argv[:2])
+            raise GhError(f"could not start {operation}: {exc}") from exc
         if completed.returncode != 0:
             detail = (completed.stderr or completed.stdout or "gh failed").strip()
             raise GhError(detail[-2000:])

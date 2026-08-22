@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from grok_pr_review.config import ConfigError
 from grok_pr_review.prompt import PromptContext, build_prompt
 from grok_pr_review.scope import DiffPlan, DiffRequest, plan_diff, truncate_diff
 
@@ -87,3 +90,25 @@ def test_truncation_notice_appears_in_prompt() -> None:
     assert "truncated" in prompt.lower()
     assert "max_diff_kb=1" in prompt
     assert len(prompt.encode("utf-8")) < len(huge.encode("utf-8")) + 8000
+
+
+def test_prompt_rejects_unknown_or_unapproved_public_comment_tones() -> None:
+    plan = plan_diff(
+        DiffRequest(scope="full-pr", before_sha=BEFORE, after_sha=AFTER, head_sha=AFTER)
+    )
+    base = {
+        "pr": PR,
+        "plan": plan,
+        "truncation": truncate_diff(FULL_PR_DIFF, 300),
+        "custom_instructions": "",
+    }
+
+    with pytest.raises(ConfigError):
+        build_prompt(PromptContext(roast_level="unknown", **base))
+    with pytest.raises(ConfigError, match="allow_unprofessional_tone"):
+        build_prompt(PromptContext(roast_level="savage", **base))
+
+    prompt = build_prompt(
+        PromptContext(roast_level="savage", allow_unprofessional_tone=True, **base)
+    )
+    assert "blunt and unsparing" in prompt
