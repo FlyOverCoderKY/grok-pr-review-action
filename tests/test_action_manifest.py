@@ -43,8 +43,16 @@ def test_action_yml_uses_xai_api_key_not_supergrok() -> None:
     assert 'GROK_VERSION="1.0.5"' in install_script
     assert "sha256sum --check" in install_script
     assert "ensure_bubblewrap" in install_script
+    assert "ensure_bwrap_userns" in install_script
     assert "apt-get install -y bubblewrap" in install_script
+    assert "apparmor-profiles" in install_script
+    assert "bwrap-userns-restrict" in install_script
+    assert "apparmor_parser -r" in install_script
+    assert "kernel.apparmor_restrict_unprivileged_userns=0" in install_script
+    assert "kernel.unprivileged_userns_clone=1" in install_script
+    assert "--unshare-user" in install_script
     assert "--ensure-bwrap" in install_script
+    assert "--sandbox off" not in install_script
     assert 'rm -rf -- "$work"' in cleanup_script
     assert 'rm -f "$HOME/.grok/' not in text
     assert 'rm -rf "$HOME/.grok' not in text
@@ -75,6 +83,10 @@ def test_readme_explains_latest_commit_and_auth() -> None:
     assert "`bwrap`" in text
     assert "Self-hosted Linux runners" in text
     assert "does **not** disable the sandbox" in text
+    assert "apparmor_restrict_unprivileged_userns" in text
+    assert "bwrap-userns-restrict" in text
+    assert "Ubuntu 24.04" in text
+    assert "does **not** disable `--sandbox strict`" in text
 
 
 def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
@@ -87,4 +99,8 @@ def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     assert "fixed_incorrectly" in text
     assert "verify_model" in text
     assert "review_mode" in text
-    assert "bubblewrap" in text.split("## [1.0.0]", 1)[0]
+    unreleased = text.split("## [1.0.0]", 1)[0]
+    assert "bubblewrap" in unreleased
+    assert "apparmor_restrict_unprivileged_userns" in unreleased
+    assert "bwrap-userns-restrict" in unreleased
+    assert "v1.0.2" in unreleased
