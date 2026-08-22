@@ -60,7 +60,7 @@ inputs:
     description: >-
       Diff to embed: full-pr (gh pr diff) or latest-commit (only the new
       work on this push). latest-commit never silently falls back to the
-      full PR diff.
+      full PR diff. Initial rounds require full-pr.
     required: false
     default: "full-pr"
   review_mode:

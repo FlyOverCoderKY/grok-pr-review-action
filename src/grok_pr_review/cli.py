@@ -57,6 +57,7 @@ from grok_pr_review.result import (
     parse_grok_output,
     should_fail_job,
     validate_coverage,
+    validate_issue_paths,
 )
 from grok_pr_review.scope import (
     CollectedReview,
@@ -233,13 +234,19 @@ def _resolve_loop_position(
             raise GhError(
                 "this synchronize run collects only the latest commit and no "
                 "prior review-loop state exists, so carried findings cannot be "
-                "verified; run an initial review first (review_mode: initial)"
+                "verified; run an initial full-PR review first "
+                "(review_mode: initial, review_scope: full-pr)"
             )
     mode, round_number = decide_loop_state(
         review_mode=mode_input,
         event_action=event_action,
         ledger=ledger,
     )
+    if mode == "initial" and scope != "full-pr":
+        raise GhError(
+            "an initial review must use review_scope: full-pr so the loop is "
+            "seeded from the complete pull request"
+        )
     return ledger, mode, round_number, schedule, escalation_lines
 
 
@@ -379,16 +386,19 @@ def cmd_finish() -> int:
             ledger=None,
             escalated=False,
         )
-        coverage_error = None
-        if state.mode == "initial":
-            diff = _read_optional(work / "diff.patch")
-            coverage_error = validate_coverage(result, changed_paths(diff))
-        if coverage_error:
+        diff = _read_optional(work / "diff.patch")
+        diff_paths = changed_paths(diff)
+        validation_error = validate_issue_paths(result, diff_paths)
+        if validation_error is None and state.mode == "initial":
+            validation_error = validate_coverage(result, diff_paths)
+        if validation_error:
             result = ReviewResult(
                 verdict="error",
                 summary=result.summary,
                 issues=result.issues,
-                incomplete_reason=(f"Grok returned invalid structured findings: {coverage_error}"),
+                incomplete_reason=(
+                    f"Grok returned invalid structured findings: {validation_error}"
+                ),
                 stop_reason=result.stop_reason,
             )
         else:
@@ -473,11 +483,11 @@ def _post_finish_result(
                     "The PR head advanced after this diff was collected. "
                     f"This review is pinned to commit {commit_id[:12]}.",
                 )
-            # A stale run never publishes authoritative loop state: a newer
-            # synchronize run owns the ledger, and posting ours would let
-            # out-of-order completions regress it.
+            # A stale or partial run never publishes authoritative loop state.
+            # The previous complete marker remains the retry boundary, so a
+            # truncated or fallback diff cannot permanently skip unseen code.
             hidden_marker = None
-            if loop_outcome is not None and not stale:
+            if loop_outcome is not None and not stale and result.verdict != "partial":
                 hidden_marker = encode_ledger(
                     replace(loop_outcome.ledger, reviewed_sha=commit_id),
                     repo=_require_env("GITHUB_REPOSITORY"),

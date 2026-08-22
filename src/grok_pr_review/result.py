@@ -15,7 +15,9 @@ MAX_TURNS_REASONS = {"max_turn", "max_turn_requests", "max_turns", "max_turns_re
 SUCCESS_REASONS = {"end_turn"}
 MAX_ISSUES = 100
 MAX_COVERAGE_ENTRIES = 500
-MAX_RESOLUTIONS = 200
+# Keep this aligned with loop.MAX_LEDGER_FINDINGS: a valid ledger must be
+# possible to resolve completely in one verification response.
+MAX_RESOLUTIONS = 300
 MAX_SUMMARY_LENGTH = 8_000
 MAX_TITLE_LENGTH = 300
 MAX_DETAIL_LENGTH = 8_000
@@ -543,8 +545,22 @@ def _parse_coverage(findings: dict[str, Any]) -> list[tuple[str, int]]:
     return entries
 
 
+def validate_issue_paths(result: ReviewResult, diff_paths: set[str]) -> str | None:
+    """Reject findings assigned to files outside the embedded diff."""
+    stray = sorted(
+        {issue.path for issue in result.issues if issue.path and issue.path not in diff_paths}
+    )
+    if stray:
+        named = ", ".join(stray[:5])
+        return f"findings reference file(s) outside the embedded diff: {named}"
+    return None
+
+
 def validate_coverage(result: ReviewResult, diff_paths: set[str]) -> str | None:
     """Reject an initial review whose coverage manifest does not account for the diff."""
+    issue_path_error = validate_issue_paths(result, diff_paths)
+    if issue_path_error:
+        return issue_path_error
     if not diff_paths:
         return None
     covered = dict(result.coverage)
@@ -558,12 +574,6 @@ def validate_coverage(result: ReviewResult, diff_paths: set[str]) -> str | None:
     if extra:
         named = ", ".join(extra[:5])
         return f"coverage lists file(s) not in the embedded diff: {named}"
-    stray = sorted(
-        {issue.path for issue in result.issues if issue.path and issue.path not in diff_paths}
-    )
-    if stray:
-        named = ", ".join(stray[:5])
-        return f"findings reference file(s) outside the embedded diff: {named}"
     reported: dict[str, int] = {}
     for issue in result.issues:
         if issue.path:

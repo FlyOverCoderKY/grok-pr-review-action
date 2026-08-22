@@ -4,6 +4,7 @@ import json
 
 from grok_pr_review.result import (
     MAX_GITHUB_BODY_BYTES,
+    MAX_RESOLUTIONS,
     Issue,
     ReviewResult,
     format_incomplete_comment,
@@ -312,3 +313,24 @@ def test_coverage_rejects_findings_outside_the_embedded_diff() -> None:
     error = validate_coverage(result, {"src/app.py"})
     assert error is not None
     assert "outside the embedded diff" in error
+
+
+def test_resolution_capacity_matches_the_maximum_ledger_backlog() -> None:
+    from grok_pr_review.loop import MAX_LEDGER_FINDINGS
+
+    assert MAX_RESOLUTIONS == MAX_LEDGER_FINDINGS
+    resolutions = [
+        {"id": f"r1-{index}", "status": "fixed", "note": "resolved"}
+        for index in range(1, MAX_LEDGER_FINDINGS + 1)
+    ]
+    envelope = {
+        "text": json.dumps(
+            {"summary": "Verified the full backlog.", "issues": [], "resolutions": resolutions}
+        ),
+        "stopReason": "EndTurn",
+    }
+
+    result = parse_grok_output(json.dumps(envelope))
+
+    assert result.verdict == "clean"
+    assert len(result.resolutions) == MAX_LEDGER_FINDINGS

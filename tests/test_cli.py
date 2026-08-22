@@ -724,6 +724,20 @@ def test_stale_finish_posts_the_review_but_never_publishes_ledger_state(
     assert github.post_kwargs["hidden_marker"] is None
 
 
+def test_partial_finish_posts_feedback_but_keeps_the_previous_ledger_authoritative(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_completed_run(tmp_path, truncated=True)
+    _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 0
+    assert github.result is not None
+    assert github.result.verdict == "partial"
+    assert github.post_kwargs["hidden_marker"] is None
+
+
 def test_initial_finish_fails_closed_when_coverage_is_missing_or_wrong(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -753,6 +767,59 @@ def test_initial_finish_fails_closed_when_coverage_is_missing_or_wrong(
     assert cli.cmd_finish() == 0
     assert github.result is not None
     assert github.result.verdict == "clean"
+
+
+def test_verify_finish_rejects_new_findings_outside_the_embedded_diff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grok_pr_review.loop import LoopState
+
+    diff = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n+x\n"
+    envelope = {
+        "text": json.dumps(
+            {
+                "summary": "Found an unrelated issue.",
+                "issues": [
+                    {
+                        "severity": "bug",
+                        "path": "src/unchanged.py",
+                        "line": 3,
+                        "title": "Outside the fix",
+                        "detail": "This file was not changed by the verification diff.",
+                    }
+                ],
+                "resolutions": [],
+            }
+        ),
+        "stopReason": "EndTurn",
+    }
+    (tmp_path / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
+    (tmp_path / "grok-exit").write_text("0", encoding="utf-8")
+    (tmp_path / "diff.patch").write_text(diff, encoding="utf-8")
+    diff_bytes = len(diff.encode("utf-8"))
+    ReviewContext(
+        pr={"number": 7, "headRefOid": REVIEWED_SHA},
+        plan=DiffPlan("full-pr", "full-pr", None, REVIEWED_SHA, None),
+        truncated=False,
+        original_bytes=diff_bytes,
+        embedded_bytes=diff_bytes,
+        max_diff_kb=300,
+        loop=LoopState(
+            mode="verify",
+            round_number=2,
+            severity_floor="risk",
+            escalated=False,
+            retired=0,
+            prior_findings=(),
+        ),
+    ).write(tmp_path / "review-context.json")
+    _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 1
+    assert github.incomplete_result is not None
+    assert "outside the embedded diff" in (github.incomplete_result.incomplete_reason or "")
 
 
 def test_forced_verify_without_state_and_corrupted_ledgers_fail_visibly(
@@ -897,11 +964,20 @@ def test_stateless_synchronize_fails_for_latest_commit_but_not_full_pr(
     monkeypatch.setattr(cli, "_github", lambda: github)
     assert cli.main(["collect"]) == 2
     assert github.comment is not None
-    assert "run an initial review" in github.comment[1]
+    assert "run an initial full-PR review" in github.comment[1]
+
+    # An initial round cannot use the same latest-commit scope: that would
+    # establish authoritative state without reviewing the full PR.
+    monkeypatch.setenv("REVIEW_MODE", "initial")
+    github.comment = None
+    assert cli.main(["collect"]) == 2
+    assert github.comment is not None
+    assert "initial review must use review_scope: full-pr" in github.comment[1]
 
     # The same state-free synchronize is safe under full-pr scope: the
     # "initial" round then genuinely covers the whole PR.
     monkeypatch.setenv("REVIEW_SCOPE", "full-pr")
+    monkeypatch.setenv("REVIEW_MODE", "auto")
     full = CollectedReview(
         pr={"number": 7, "headRefOid": head},
         plan=DiffPlan("full-pr", "full-pr", None, head, None),

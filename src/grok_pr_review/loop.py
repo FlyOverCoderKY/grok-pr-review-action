@@ -263,7 +263,7 @@ def _overflow_message(open_count: int) -> str:
     return (
         f"review-loop state overflow: {open_count} open findings cannot all be "
         "persisted in the ledger; fix or dispute findings to shrink the backlog, "
-        "or reset the loop with review_mode: initial"
+        "or reset the loop with review_mode: initial and review_scope: full-pr"
     )
 
 
@@ -326,7 +326,8 @@ def latest_ledger(bodies: list[str], *, repo: str, pr_number: int) -> Ledger | N
         if ledger is None:
             raise GhError(
                 "the newest review-loop ledger on this PR is corrupted or bound "
-                "to a different repository; force review_mode: initial to reset it"
+                "to a different repository; force review_mode: initial with "
+                "review_scope: full-pr to reset it"
             )
         return ledger
     return None
