@@ -298,3 +298,17 @@ def test_inline_comments_carry_extractable_finding_markers() -> None:
     assert len(comments) == 1
     assert extract_finding_marker(comments[0]["body"]) == "r1-1"
     assert extract_finding_marker("no marker") is None
+
+
+def test_coverage_rejects_findings_outside_the_embedded_diff() -> None:
+    from grok_pr_review.result import validate_coverage
+
+    result = ReviewResult(
+        verdict="issues",
+        summary="One stray.",
+        issues=[Issue("bug", "src/other.py", 3, "Stray", "Outside the diff.")],
+        coverage=[("src/app.py", 0)],
+    )
+    error = validate_coverage(result, {"src/app.py"})
+    assert error is not None
+    assert "outside the embedded diff" in error

@@ -280,3 +280,27 @@ def test_full_pr_fails_if_head_changes_during_collection() -> None:
             max_diff_kb=300,
             github=MovingHead(),
         )
+
+
+def test_changed_paths_sees_renames_mode_changes_and_binary_files() -> None:
+    from grok_pr_review.scope import changed_paths
+
+    diff = (
+        "diff --git a/src/app.py b/src/app.py\n"
+        "--- a/src/app.py\n"
+        "+++ b/src/app.py\n"
+        "@@ -1 +1 @@\n"
+        "-x\n"
+        "+y\n"
+        "diff --git a/old_name.py b/new_name.py\n"
+        "similarity index 100%\n"
+        "rename from old_name.py\n"
+        "rename to new_name.py\n"
+        "diff --git a/tool.sh b/tool.sh\n"
+        "old mode 100644\n"
+        "new mode 100755\n"
+        "diff --git a/asset.bin b/asset.bin\n"
+        "Binary files a/asset.bin and b/asset.bin differ\n"
+    )
+    paths = changed_paths(diff)
+    assert paths == {"src/app.py", "old_name.py", "new_name.py", "tool.sh", "asset.bin"}

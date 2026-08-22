@@ -190,14 +190,27 @@ def _cut_diff_at_boundary(data: bytes, limit: int) -> bytes:
 
 
 def changed_paths(diff_text: str) -> set[str]:
-    """File paths touched by a unified diff (old and new sides, no /dev/null)."""
+    """File paths touched by a unified diff, old and new sides.
+
+    Reads the `diff --git` headers as well as the `---`/`+++` and rename
+    lines, so pure renames, mode-only changes, and binary files (which have
+    no `---`/`+++` pair) are still accounted for.
+    """
     paths: set[str] = set()
     for line in diff_text.splitlines():
-        if line.startswith("--- a/"):
-            paths.add(line[6:].strip())
-        elif line.startswith("+++ b/"):
-            paths.add(line[6:].strip())
-    return {path for path in paths if path}
+        if line.startswith("diff --git a/"):
+            remainder = line[len("diff --git a/") :]
+            left, separator, right = remainder.rpartition(" b/")
+            if separator:
+                paths.add(left)
+                paths.add(right)
+        elif line.startswith(("--- a/", "+++ b/")):
+            paths.add(line[6:])
+        elif line.startswith("rename from "):
+            paths.add(line[len("rename from ") :])
+        elif line.startswith("rename to "):
+            paths.add(line[len("rename to ") :])
+    return {path.strip() for path in paths if path.strip()}
 
 
 def fetch_scoped_diff(

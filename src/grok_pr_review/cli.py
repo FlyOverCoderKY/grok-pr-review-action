@@ -21,6 +21,7 @@ from grok_pr_review.config import (
     MAX_VERIFY_ESCALATION_LINES,
     ActionConfig,
     ConfigError,
+    Severity,
     parse_bool,
     parse_bot_login,
     parse_bounded_int,
@@ -36,6 +37,7 @@ from grok_pr_review.config import (
 )
 from grok_pr_review.github import GitHubCli
 from grok_pr_review.loop import (
+    Ledger,
     LoopState,
     RoundOutcome,
     apply_round,
@@ -43,7 +45,6 @@ from grok_pr_review.loop import (
     count_changed_lines,
     decide_loop_state,
     encode_ledger,
-    has_ledger_marker,
     latest_ledger,
     render_agent_context,
 )
@@ -137,6 +138,18 @@ def cmd_collect() -> int:
     before, after, head = _event_shas()
     github = _github()
     try:
+        ledger, mode, round_number, schedule, escalation_lines = _resolve_loop_position(
+            github, pr_number, scope
+        )
+    except GhError as exc:
+        _report_pipeline_failure("review-loop state recovery", exc)
+        raise
+    if mode == "verify" and scope == "latest-commit" and ledger is not None:
+        # Continuity: verify everything since the last published review, not
+        # just this push's webhook range, so a run racing an unfinished older
+        # run can never skip the commits that run was reviewing.
+        before = ledger.reviewed_sha or before
+    try:
         collected = collect_review_material(
             pr_number=pr_number,
             request=DiffRequest(
@@ -151,11 +164,17 @@ def cmd_collect() -> int:
     except (GhError, ValueError) as exc:
         _report_pipeline_failure("diff collection", exc)
         raise
-    try:
-        state = _decide_loop(work, github, pr_number, collected)
-    except GhError as exc:
-        _report_pipeline_failure("review-loop state recovery", exc)
-        raise
+    state = _stage_loop_inputs(
+        work,
+        github,
+        pr_number,
+        collected,
+        ledger=ledger,
+        mode=mode,
+        round_number=round_number,
+        schedule=schedule,
+        escalation_lines=escalation_lines,
+    )
     (work / "diff.patch").write_text(collected.diff, encoding="utf-8")
     ReviewContext.from_collected(collected, loop=state).write(work / "review-context.json")
     print(
@@ -174,15 +193,18 @@ def cmd_collect() -> int:
     return 0
 
 
-def _decide_loop(
-    work: Path, github: GitHubCli, pr_number: int, collected: CollectedReview
-) -> LoopState:
-    """Place this run in the review loop and stage the verify-round inputs.
+def _resolve_loop_position(
+    github: GitHubCli, pr_number: int, scope: str
+) -> tuple[Ledger | None, str, int, tuple[Severity, ...], int]:
+    """Recover the loop position before collecting the diff.
 
-    State recovery fails closed: a GitHub read failure or a corrupted ledger
-    raises instead of silently resetting to round 1, because a reset during a
-    latest-commit synchronize run would discard every carried finding. Only an
-    explicit initial run (or a genuinely state-free PR) starts fresh.
+    State recovery fails closed: a GitHub read failure or a corrupted newest
+    ledger raises instead of silently resetting to round 1, because a reset
+    during a latest-commit synchronize run would discard every carried
+    finding. A state-free synchronize run is likewise refused under
+    latest-commit scope, where an "initial" review of one push could report
+    clean without ever seeing the rest of the PR. Only an explicit initial
+    run (or a state-free full-pr collection) starts fresh.
     """
     mode_input = parse_review_mode(os.environ.get("REVIEW_MODE", "auto"))
     schedule = parse_severity_schedule(
@@ -196,26 +218,44 @@ def _decide_loop(
     )
     repo = _require_env("GITHUB_REPOSITORY")
     bot_login = parse_bot_login(os.environ.get("BOT_LOGIN", DEFAULT_BOT_LOGIN))
+    event_action = os.environ.get("EVENT_ACTION", "").strip().lower()
 
     ledger = None
     if mode_input != "initial":
         bodies = github.list_bot_review_bodies(pr_number, bot_login)
         ledger = latest_ledger(bodies, repo=repo, pr_number=pr_number)
-        if ledger is None and any(has_ledger_marker(body) for body in bodies):
-            raise GhError(
-                "the review-loop ledger on this PR is corrupted or bound to a "
-                "different repository; force review_mode: initial to reset it"
-            )
         if ledger is None and mode_input == "verify":
             raise GhError(
                 "review_mode is verify but no prior review-loop state exists on "
                 "this PR; run an initial review first"
             )
+        if ledger is None and event_action == "synchronize" and scope == "latest-commit":
+            raise GhError(
+                "this synchronize run collects only the latest commit and no "
+                "prior review-loop state exists, so carried findings cannot be "
+                "verified; run an initial review first (review_mode: initial)"
+            )
     mode, round_number = decide_loop_state(
         review_mode=mode_input,
-        event_action=os.environ.get("EVENT_ACTION", ""),
+        event_action=event_action,
         ledger=ledger,
     )
+    return ledger, mode, round_number, schedule, escalation_lines
+
+
+def _stage_loop_inputs(
+    work: Path,
+    github: GitHubCli,
+    pr_number: int,
+    collected: CollectedReview,
+    *,
+    ledger: Ledger | None,
+    mode: str,
+    round_number: int,
+    schedule: tuple[Severity, ...],
+    escalation_lines: int,
+) -> LoopState:
+    """Build the loop state from the collected diff and stage verify inputs."""
     escalated = mode == "verify" and (
         collected.truncation.truncated or count_changed_lines(collected.diff) > escalation_lines
     )
@@ -385,6 +425,17 @@ def _parse_finish_result(work: Path, context: ReviewContext) -> ReviewResult:
     if context.truncated:
         reason = context.truncation_notice or "The diff was truncated."
         result = mark_partial(result, reason)
+    if (
+        context.loop is not None
+        and context.loop.mode == "verify"
+        and context.plan.kind == "single-commit"
+        and context.plan.fallback_notice
+    ):
+        result = mark_partial(
+            result,
+            "History diverged, so this verification round embedded only the "
+            "single latest commit instead of the full range since the last review.",
+        )
     return result
 
 

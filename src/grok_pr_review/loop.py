@@ -22,6 +22,7 @@ from grok_pr_review.result import (
     _valid_review_path,
     neutralize_mentions,
 )
+from grok_pr_review.scope import GhError
 
 LEDGER_PREFIX = "<!-- grok-review-ledger:v1:"
 LEDGER_SUFFIX = " -->"
@@ -232,20 +233,38 @@ def encode_ledger(ledger: Ledger, *, repo: str, pr_number: int) -> str:
     """Encode a marker bound to this repo/PR that is guaranteed to decode.
 
     Findings are kept in priority order (open bugs, open risks, open nits,
-    then disputed) and trimmed deterministically to both the finding-count
-    and byte limits, so a valid next-round load can never be bricked by an
-    oversized or over-full marker.
+    then disputed) with titles clipped, and only settled disputed findings may
+    be dropped to fit the count and byte limits. Losing an unresolved finding
+    is worse than failing visibly, so if the open findings alone cannot be
+    persisted this raises instead of silently discarding state.
     """
-    findings = _trim_findings(list(ledger.findings))
+    ordered = _trim_findings(list(ledger.findings))
+    open_count = sum(1 for finding in ordered if finding.status == "open")
+    if open_count > MAX_LEDGER_FINDINGS:
+        raise GhError(_overflow_message(open_count))
+    findings = ordered[:MAX_LEDGER_FINDINGS]
     while True:
         encoded = _encode(ledger, findings, repo=repo, pr_number=pr_number)
-        if len(encoded) <= MAX_LEDGER_BYTES or not findings:
+        if len(encoded) <= MAX_LEDGER_BYTES:
             break
-        findings = findings[:-1]
+        if findings and findings[-1].status == "disputed":
+            findings = findings[:-1]
+            continue
+        raise GhError(_overflow_message(open_count))
     token = encoded[len(LEDGER_PREFIX) : -len(LEDGER_SUFFIX)]
     if _decode(token, repo=repo, pr_number=pr_number) is None:
-        encoded = _encode(ledger, [], repo=repo, pr_number=pr_number)
+        raise GhError(
+            "the review-loop ledger failed its decode self-check; refusing to publish invalid state"
+        )
     return encoded
+
+
+def _overflow_message(open_count: int) -> str:
+    return (
+        f"review-loop state overflow: {open_count} open findings cannot all be "
+        "persisted in the ledger; fix or dispute findings to shrink the backlog, "
+        "or reset the loop with review_mode: initial"
+    )
 
 
 def _trim_findings(findings: list[LedgerFinding]) -> list[LedgerFinding]:
@@ -254,8 +273,7 @@ def _trim_findings(findings: list[LedgerFinding]) -> list[LedgerFinding]:
         return (status_rank, -SEVERITY_RANK.get(finding.severity, 0))
 
     ordered = sorted(findings, key=priority)
-    clipped = [replace(finding, title=finding.title[:80].strip() or "…") for finding in ordered]
-    return clipped[:MAX_LEDGER_FINDINGS]
+    return [replace(finding, title=finding.title[:80].strip() or "…") for finding in ordered]
 
 
 def _encode(ledger: Ledger, findings: list[LedgerFinding], *, repo: str, pr_number: int) -> str:
@@ -295,10 +313,22 @@ def extract_ledger(body: str, *, repo: str, pr_number: int) -> Ledger | None:
 
 
 def latest_ledger(bodies: list[str], *, repo: str, pr_number: int) -> Ledger | None:
+    """The ledger from the newest marker-bearing body, or None when state-free.
+
+    The newest marker is authoritative: if it fails to decode, this raises
+    rather than falling back to an older valid ledger, because rolling state
+    back a round would silently resurrect resolved findings and lose new ones.
+    """
     for body in reversed(bodies):
+        if not has_ledger_marker(body):
+            continue
         ledger = extract_ledger(body, repo=repo, pr_number=pr_number)
-        if ledger is not None:
-            return ledger
+        if ledger is None:
+            raise GhError(
+                "the newest review-loop ledger on this PR is corrupted or bound "
+                "to a different repository; force review_mode: initial to reset it"
+            )
+        return ledger
     return None
 
 

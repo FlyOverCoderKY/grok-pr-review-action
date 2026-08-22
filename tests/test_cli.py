@@ -401,7 +401,13 @@ def test_mocked_pipeline_preserves_the_review_boundary_and_reviewed_sha(
     assert "diff --git a/app.py" in (work / "prompt.md").read_text(encoding="utf-8")
 
     envelope = {
-        "text": json.dumps({"summary": "Looks good.", "issues": []}),
+        "text": json.dumps(
+            {
+                "summary": "Looks good.",
+                "issues": [],
+                "coverage": [{"path": "app.py", "findings": 0}],
+            }
+        ),
         "stopReason": "EndTurn",
     }
     (work / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
@@ -462,6 +468,9 @@ def test_finish_posts_recovered_findings_for_an_incomplete_run(
 class PipelineFailureGitHub:
     def __init__(self) -> None:
         self.comment: tuple[int, str] | None = None
+
+    def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+        return []
 
     def post_issue_comment(self, pr_number: int, body: str) -> str:
         self.comment = (pr_number, body)
@@ -649,8 +658,13 @@ def test_collect_verify_round_reads_ledger_and_stages_verify_inputs(
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
 
+    last_reviewed = "b" * 40
     prior = encode_ledger(
-        Ledger(1, (LedgerFinding("r1-1", "bug", "src/app.py", 3, "Crash", "open"),)),
+        Ledger(
+            1,
+            (LedgerFinding("r1-1", "bug", "src/app.py", 3, "Crash", "open"),),
+            reviewed_sha=last_reviewed,
+        ),
         repo="owner/repo",
         pr_number=7,
     )
@@ -671,9 +685,18 @@ def test_collect_verify_round_reads_ledger_and_stages_verify_inputs(
         plan=DiffPlan("latest-commit", "single-commit", None, head, None),
         truncation=Truncation("diff --git a/a b/a\n+x\n", False, 22, 22, 300),
     )
-    monkeypatch.setattr(cli, "collect_review_material", lambda **_kwargs: collected)
+    captured_request: dict[str, Any] = {}
+
+    def capture(**kwargs: Any) -> CollectedReview:
+        captured_request.update(kwargs)
+        return collected
+
+    monkeypatch.setattr(cli, "collect_review_material", capture)
 
     assert cli.cmd_collect() == 0
+    # Continuity: the verify diff starts at the last published review's SHA,
+    # not this push's webhook range.
+    assert captured_request["request"].before_sha == last_reviewed
     context = ReviewContext.read(work / "review-context.json")
     assert context.loop is not None
     assert context.loop.mode == "verify"
@@ -842,3 +865,47 @@ def test_finish_labels_the_review_with_the_model_that_actually_ran(
 
     assert cli.cmd_finish() == 0
     assert github.post_kwargs["model"] == "grok-4-fast"
+
+
+def test_stateless_synchronize_fails_for_latest_commit_but_not_full_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    head = "a" * 40
+    for name, value in {
+        "WORK": str(tmp_path / "work"),
+        "PR_NUMBER": "7",
+        "REVIEW_SCOPE": "latest-commit",
+        "MAX_DIFF_KB": "300",
+        "HEAD_SHA": head,
+        "GITHUB_REPOSITORY": "owner/repo",
+        "REVIEW_MODE": "auto",
+        "EVENT_ACTION": "synchronize",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+    collected = CollectedReview(
+        pr={"number": 7, "headRefOid": head},
+        plan=DiffPlan("latest-commit", "single-commit", None, head, None),
+        truncation=Truncation("diff --git a/a b/a\n+x\n", False, 22, 22, 300),
+    )
+    monkeypatch.setattr(cli, "collect_review_material", lambda **_kwargs: collected)
+
+    class EmptyHistory(PipelineFailureGitHub):
+        pass
+
+    github = EmptyHistory()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+    assert cli.main(["collect"]) == 2
+    assert github.comment is not None
+    assert "run an initial review" in github.comment[1]
+
+    # The same state-free synchronize is safe under full-pr scope: the
+    # "initial" round then genuinely covers the whole PR.
+    monkeypatch.setenv("REVIEW_SCOPE", "full-pr")
+    full = CollectedReview(
+        pr={"number": 7, "headRefOid": head},
+        plan=DiffPlan("full-pr", "full-pr", None, head, None),
+        truncation=Truncation("diff --git a/a b/a\n+x\n", False, 22, 22, 300),
+    )
+    monkeypatch.setattr(cli, "collect_review_material", lambda **_kwargs: full)
+    assert cli.main(["collect"]) == 0

@@ -558,6 +558,12 @@ def validate_coverage(result: ReviewResult, diff_paths: set[str]) -> str | None:
     if extra:
         named = ", ".join(extra[:5])
         return f"coverage lists file(s) not in the embedded diff: {named}"
+    stray = sorted(
+        {issue.path for issue in result.issues if issue.path and issue.path not in diff_paths}
+    )
+    if stray:
+        named = ", ".join(stray[:5])
+        return f"findings reference file(s) outside the embedded diff: {named}"
     reported: dict[str, int] = {}
     for issue in result.issues:
         if issue.path:

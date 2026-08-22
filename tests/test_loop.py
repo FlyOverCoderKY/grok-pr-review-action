@@ -212,27 +212,64 @@ def test_render_agent_context_is_bounded_and_labeled() -> None:
     assert len(text.encode("utf-8")) <= 17_000
 
 
-def test_encode_ledger_trims_deterministically_and_always_decodes() -> None:
-    findings = tuple(
+def test_encode_ledger_preserves_open_findings_or_fails_visibly() -> None:
+    import pytest
+
+    from grok_pr_review.scope import GhError
+
+    open_findings = tuple(
         LedgerFinding(
             id=f"r1-{index + 1}",
-            severity=("nit", "risk", "bug")[index % 3],
-            path="src/" + ("deep/" * 60) + f"file_{index}.py",
+            severity=("bug", "risk", "nit")[index % 3],
+            path=f"src/file_{index}.py",
             line=index + 1,
             title="A very long finding title " * 10,
-            status="open" if index % 4 else "disputed",
+            status="open",
         )
-        for index in range(400)
+        for index in range(120)
     )
-    marker = encode_ledger(Ledger(5, findings), repo="owner/repo", pr_number=7)
-    assert len(marker) <= 40_000 + 60
+    disputed = tuple(
+        LedgerFinding(
+            id=f"r2-{index + 1}",
+            severity="nit",
+            path="src/" + ("deep/" * 80) + f"d_{index}.py",
+            line=1,
+            title="Settled",
+            status="disputed",
+        )
+        for index in range(150)
+    )
+    marker = encode_ledger(Ledger(5, open_findings + disputed), repo="owner/repo", pr_number=7)
     decoded = extract_ledger(marker, repo="owner/repo", pr_number=7)
     assert decoded is not None
-    assert len(decoded.findings) <= 300
-    kept = decoded.findings
-    open_bugs_kept = sum(1 for f in kept if f.status == "open" and f.severity == "bug")
-    open_bugs_total = sum(1 for f in findings if f.status == "open" and f.severity == "bug")
-    assert open_bugs_kept == min(open_bugs_total, len(kept))
+    kept_open = [f for f in decoded.findings if f.status == "open"]
+    assert len(kept_open) == 120  # every open finding survives; disputed may be dropped
+
+    too_many_open = tuple(
+        LedgerFinding(f"r1-{i + 1}", "bug", None, None, "t", "open") for i in range(301)
+    )
+    with pytest.raises(GhError, match="overflow"):
+        encode_ledger(Ledger(5, too_many_open), repo="owner/repo", pr_number=7)
+
+    oversized_open = tuple(
+        LedgerFinding(f"r1-{i + 1}", "bug", "src/" + ("deep/" * 150) + f"{i}.py", 1, "t", "open")
+        for i in range(300)
+    )
+    with pytest.raises(GhError, match="overflow"):
+        encode_ledger(Ledger(5, oversized_open), repo="owner/repo", pr_number=7)
+
+
+def test_latest_ledger_fails_on_a_corrupt_newest_marker_instead_of_rolling_back() -> None:
+    import pytest
+
+    from grok_pr_review.scope import GhError
+
+    older = encode_ledger(Ledger(2, (_finding("r1-1"),)), repo="owner/repo", pr_number=7)
+    corrupt = "<!-- grok-review-ledger:v1:AAAA -->"
+    with pytest.raises(GhError, match="corrupted"):
+        latest_ledger([older, corrupt], repo="owner/repo", pr_number=7)
+    recovered = latest_ledger([corrupt, older], repo="owner/repo", pr_number=7)
+    assert recovered is not None and recovered.round_number == 2
 
 
 def test_decide_loop_state_clamps_the_round_counter() -> None:
