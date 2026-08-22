@@ -242,3 +242,59 @@ def test_review_body_limit_does_not_change_normal_reviews() -> None:
 
     assert "Looks good." in body
     assert "Some finding detail was omitted" not in body
+
+
+def test_resolutions_parse_with_findings_and_fail_closed_when_invalid() -> None:
+    payload = {
+        "summary": "Verified.",
+        "issues": [],
+        "resolutions": [
+            {"id": "r1-1", "status": "Fixed", "note": "done"},
+            {"id": "r1-2", "status": "fixed-incorrectly", "note": None},
+        ],
+    }
+    envelope = {"text": json.dumps(payload), "stopReason": "EndTurn"}
+    result = parse_grok_output(json.dumps(envelope))
+    assert result.verdict == "clean"
+    assert [(r.id, r.status) for r in result.resolutions] == [
+        ("r1-1", "fixed"),
+        ("r1-2", "fixed_incorrectly"),
+    ]
+
+    bad = dict(payload, resolutions=[{"id": "r1-1", "status": "maybe"}])
+    envelope = {"text": json.dumps(bad), "stopReason": "EndTurn"}
+    result = parse_grok_output(json.dumps(envelope))
+    assert result.verdict == "error"
+    assert result.incomplete_reason is not None
+    assert "invalid structured findings" in result.incomplete_reason
+
+
+def test_hidden_marker_sits_under_the_heading_with_extra_lines_after_metadata() -> None:
+    result = ReviewResult(verdict="clean", summary="Fine.", stop_reason="EndTurn")
+    body = format_review_body_parts(
+        result,
+        scope="full-pr",
+        model="grok-4.6",
+        run_url="",
+        hidden_marker="<!-- test-marker -->",
+        extra_lines=["### Round 2 resolution", "- ✅ `r1-1` fixed — **Crash**"],
+    )[0]
+    lines = body.splitlines()
+    assert lines[0].startswith("## Grok PR review")
+    assert lines[1] == "<!-- test-marker -->"
+    assert "### Round 2 resolution" in body
+    assert "`r1-1` fixed" in body
+
+
+def test_inline_comments_carry_extractable_finding_markers() -> None:
+    from grok_pr_review.result import extract_finding_marker, inline_review_comments
+
+    result = ReviewResult(
+        verdict="issues",
+        summary="One.",
+        issues=[Issue("bug", "src/app.py", 3, "Crash", "Boom.", id="r1-1")],
+    )
+    comments = inline_review_comments(result)
+    assert len(comments) == 1
+    assert extract_finding_marker(comments[0]["body"]) == "r1-1"
+    assert extract_finding_marker("no marker") is None

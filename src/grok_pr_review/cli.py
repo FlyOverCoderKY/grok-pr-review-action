@@ -13,19 +13,36 @@ from typing import Any
 from grok_pr_review.artifacts import ArtifactError, ReviewContext
 from grok_pr_review.auth import AuthError, require_xai_api_key, write_grok_config
 from grok_pr_review.config import (
+    DEFAULT_SEVERITY_SCHEDULE,
+    DEFAULT_VERIFY_ESCALATION_LINES,
     MAX_DIFF_KB,
     MAX_GITHUB_TIMEOUT_SECONDS,
+    MAX_VERIFY_ESCALATION_LINES,
     ActionConfig,
     ConfigError,
     parse_bool,
     parse_bounded_int,
     parse_custom_instructions,
+    parse_effort,
     parse_fail_on,
     parse_model,
+    parse_optional_model,
+    parse_review_mode,
     parse_review_scope,
     parse_roast_level,
+    parse_severity_schedule,
 )
 from grok_pr_review.github import GitHubCli
+from grok_pr_review.loop import (
+    LoopState,
+    RoundOutcome,
+    apply_round,
+    build_loop_state,
+    count_changed_lines,
+    decide_loop_state,
+    latest_ledger,
+    render_agent_context,
+)
 from grok_pr_review.prompt import build_prompt_from_collected
 from grok_pr_review.result import (
     ReviewResult,
@@ -94,7 +111,8 @@ def cmd_write_config() -> int:
     require_xai_api_key()
     grok_home = Path(_require_env("GROK_HOME"))
     model = parse_model(os.environ.get("MODEL", "grok-4.6"))
-    path = write_grok_config(grok_home, model)
+    verify_model = parse_optional_model(os.environ.get("VERIFY_MODEL", ""))
+    path = write_grok_config(grok_home, model, [verify_model] if verify_model else [])
     print(f"Wrote {path} (api.x.ai, env_key=XAI_API_KEY).")
     return 0
 
@@ -126,17 +144,77 @@ def cmd_collect() -> int:
     except (GhError, ValueError) as exc:
         _report_pipeline_failure("diff collection", exc)
         raise
+    state = _decide_loop(work, github, pr_number, collected.diff)
     (work / "diff.patch").write_text(collected.diff, encoding="utf-8")
-    ReviewContext.from_collected(collected).write(work / "review-context.json")
+    ReviewContext.from_collected(collected, loop=state).write(work / "review-context.json")
     print(
         f"Collected {collected.plan.kind} diff "
         f"({collected.truncation.embedded_bytes} bytes embedded)."
+    )
+    print(
+        f"Review round {state.round_number} ({state.mode}, "
+        f"severity floor {state.severity_floor}"
+        f"{', escalated to a full-severity review' if state.escalated else ''})."
     )
     if collected.plan.fallback_notice:
         print(collected.plan.fallback_notice)
     if collected.truncation.notice:
         print(collected.truncation.notice)
     return 0
+
+
+def _decide_loop(work: Path, github: GitHubCli, pr_number: int, diff: str) -> LoopState:
+    """Place this run in the review loop and stage the verify-round inputs."""
+    mode_input = parse_review_mode(os.environ.get("REVIEW_MODE", "auto"))
+    schedule = parse_severity_schedule(
+        os.environ.get("SEVERITY_SCHEDULE", DEFAULT_SEVERITY_SCHEDULE)
+    )
+    escalation_lines = parse_bounded_int(
+        os.environ.get("VERIFY_ESCALATION_LINES", str(DEFAULT_VERIFY_ESCALATION_LINES)),
+        "verify_escalation_lines",
+        minimum=1,
+        maximum=MAX_VERIFY_ESCALATION_LINES,
+    )
+
+    ledger = None
+    if mode_input != "initial":
+        try:
+            ledger = latest_ledger(github.list_review_bodies(pr_number))
+        except GhError as exc:
+            print(f"Could not read prior reviews; starting a fresh initial round: {exc}")
+    mode, round_number = decide_loop_state(
+        review_mode=mode_input,
+        event_action=os.environ.get("EVENT_ACTION", ""),
+        ledger=ledger,
+    )
+    escalated = mode == "verify" and count_changed_lines(diff) > escalation_lines
+    state = build_loop_state(
+        mode=mode,
+        round_number=round_number,
+        schedule=schedule,
+        ledger=ledger,
+        escalated=escalated,
+    )
+
+    replies_text = ""
+    if state.mode == "verify":
+        try:
+            replies_text = render_agent_context(
+                github.list_finding_replies(pr_number),
+                github.list_recent_issue_comments(pr_number),
+            )
+        except GhError as exc:
+            print(f"Could not fetch reviewer replies; verifying from commits only: {exc}")
+    (work / "agent-replies.md").write_text(replies_text, encoding="utf-8")
+
+    verify_model = parse_optional_model(os.environ.get("VERIFY_MODEL", ""))
+    verify_effort = parse_effort(os.environ.get("VERIFY_EFFORT", ""))
+    if state.mode == "verify" and not state.escalated:
+        if verify_model:
+            (work / "model-override").write_text(verify_model, encoding="utf-8")
+        if verify_effort:
+            (work / "effort-override").write_text(verify_effort, encoding="utf-8")
+    return state
 
 
 def cmd_prompt() -> int:
@@ -155,6 +233,8 @@ def cmd_prompt() -> int:
         ),
         custom_instructions=parse_custom_instructions(os.environ.get("CUSTOM_INSTRUCTIONS", "")),
         allow_unprofessional_tone=allow_unprofessional,
+        loop_state=context.loop,
+        agent_replies=_read_optional(work / "agent-replies.md").strip(),
     )
     (work / "prompt.md").write_text(text, encoding="utf-8")
     print(f"Wrote {work / 'prompt.md'} ({len(text.encode())} bytes).")
@@ -218,6 +298,17 @@ def cmd_finish() -> int:
     status_comments = parse_bool(os.environ.get("STATUS_COMMENTS", "true"), "status_comments")
     context = ReviewContext.read(work / "review-context.json")
     result = _parse_finish_result(work, context)
+    loop_outcome: RoundOutcome | None = None
+    if not result.incomplete:
+        state = context.loop or build_loop_state(
+            mode="initial",
+            round_number=1,
+            schedule=parse_severity_schedule(DEFAULT_SEVERITY_SCHEDULE),
+            ledger=None,
+            escalated=False,
+        )
+        loop_outcome = apply_round(state, result)
+        result = loop_outcome.result
     github = _github()
     outcome = _post_finish_result(
         github,
@@ -227,6 +318,7 @@ def cmd_finish() -> int:
         scope=scope,
         model=model,
         run_url=run_url,
+        loop_outcome=loop_outcome,
     )
     return _finalize_finish(
         github,
@@ -236,6 +328,8 @@ def cmd_finish() -> int:
         scope=scope,
         fail_on=fail_on,
         status_comments=status_comments,
+        loop_outcome=loop_outcome,
+        round_number=context.loop.round_number if context.loop else 1,
     )
 
 
@@ -258,6 +352,7 @@ def _post_finish_result(
     scope: str,
     model: str,
     run_url: str,
+    loop_outcome: RoundOutcome | None = None,
 ) -> FinishOutcome:
     review_url = ""
     try:
@@ -288,6 +383,8 @@ def _post_finish_result(
                 scope=scope,
                 model=model,
                 run_url=run_url,
+                hidden_marker=loop_outcome.hidden_marker if loop_outcome else None,
+                extra_lines=loop_outcome.extra_lines if loop_outcome else None,
             )
     except GhError as exc:
         reason = f"Failed to post PR feedback: {exc}"
@@ -318,8 +415,18 @@ def _finalize_finish(
     scope: str,
     fail_on: str,
     status_comments: bool,
+    loop_outcome: RoundOutcome | None = None,
+    round_number: int = 1,
 ) -> int:
     result = outcome.result
+    if loop_outcome is not None and not result.incomplete:
+        counting_open = True
+        issue_count = loop_outcome.open_issue_count
+        bug_count = loop_outcome.open_bug_count
+    else:
+        counting_open = False
+        issue_count = result.issue_count
+        bug_count = result.bug_count
     _update_status(
         github,
         work,
@@ -329,13 +436,20 @@ def _finalize_finish(
         outcome.review_url,
         enabled=status_comments,
     )
-    _write_outputs(result, outcome.review_url)
+    _write_outputs(
+        result,
+        outcome.review_url,
+        issue_count=issue_count,
+        bug_count=bug_count,
+        round_number=round_number,
+    )
     (work / "result.json").write_text(
         json.dumps(
             {
                 "verdict": result.verdict,
-                "issue_count": result.issue_count,
-                "bug_count": result.bug_count,
+                "issue_count": issue_count,
+                "bug_count": bug_count,
+                "round": round_number,
                 "review_url": outcome.review_url,
                 "incomplete_reason": result.incomplete_reason,
                 "partial_reason": result.partial_reason,
@@ -344,8 +458,13 @@ def _finalize_finish(
         ),
         encoding="utf-8",
     )
-    print(f"verdict={result.verdict} issues={result.issue_count} bugs={result.bug_count}")
-    if should_fail_job(fail_on, result):
+    print(f"verdict={result.verdict} issues={issue_count} bugs={bug_count} round={round_number}")
+    if should_fail_job(
+        fail_on,
+        result,
+        open_bug_count=bug_count if counting_open else None,
+        open_issue_count=issue_count if counting_open else None,
+    ):
         reason = "the review did not complete" if result.incomplete else f"fail_on={fail_on}"
         print(f"Failing the job because {reason}.")
         return 1
@@ -379,14 +498,22 @@ def _update_status(
         print(f"Could not update status comment: {exc}")
 
 
-def _write_outputs(result: ReviewResult, review_url: str) -> None:
+def _write_outputs(
+    result: ReviewResult,
+    review_url: str,
+    *,
+    issue_count: int,
+    bug_count: int,
+    round_number: int,
+) -> None:
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
         return
     with Path(output_path).open("a", encoding="utf-8") as handle:
         handle.write(f"verdict={result.verdict}\n")
-        handle.write(f"issue_count={result.issue_count}\n")
-        handle.write(f"bug_count={result.bug_count}\n")
+        handle.write(f"issue_count={issue_count}\n")
+        handle.write(f"bug_count={bug_count}\n")
+        handle.write(f"round={round_number}\n")
         handle.write(f"review_url={review_url}\n")
 
 

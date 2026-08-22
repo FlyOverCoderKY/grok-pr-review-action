@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
@@ -14,10 +14,14 @@ Verdict = Literal["clean", "issues", "partial", "error"]
 MAX_TURNS_REASONS = {"max_turn", "max_turn_requests", "max_turns", "max_turns_reached"}
 SUCCESS_REASONS = {"end_turn"}
 MAX_ISSUES = 100
+MAX_RESOLUTIONS = 200
 MAX_SUMMARY_LENGTH = 8_000
 MAX_TITLE_LENGTH = 300
 MAX_DETAIL_LENGTH = 8_000
 MAX_PATH_LENGTH = 1_000
+MAX_FINDING_ID_LENGTH = 32
+RESOLUTION_STATUSES = ("fixed", "not_fixed", "fixed_incorrectly", "disputed")
+SEVERITY_RANK = {"nit": 0, "risk": 1, "bug": 2}
 MAX_GITHUB_BODY_BYTES = 60_000
 TARGET_GITHUB_BODY_BYTES = 58_000
 
@@ -35,10 +39,20 @@ class Issue:
     line: int | None
     title: str
     detail: str
+    id: str | None = None
 
     @property
     def is_bug(self) -> bool:
         return self.severity == "bug"
+
+
+@dataclass(frozen=True)
+class Resolution:
+    """The model's verdict on one prior-round finding during a verify round."""
+
+    id: str
+    status: str  # fixed | not_fixed | fixed_incorrectly | disputed
+    note: str
 
 
 @dataclass(frozen=True)
@@ -49,6 +63,7 @@ class ReviewResult:
     incomplete_reason: str | None = None
     stop_reason: str | None = None
     partial_reason: str | None = None
+    resolutions: list[Resolution] = field(default_factory=list)
 
     @property
     def issue_count(self) -> int:
@@ -63,16 +78,28 @@ class ReviewResult:
         return self.verdict == "error"
 
 
-def should_fail_job(fail_on: str, result: ReviewResult) -> bool:
-    """Operational errors always fail; fail_on controls completed review findings."""
+def should_fail_job(
+    fail_on: str,
+    result: ReviewResult,
+    *,
+    open_bug_count: int | None = None,
+    open_issue_count: int | None = None,
+) -> bool:
+    """Operational errors always fail; fail_on controls completed review findings.
+
+    In verify rounds the open counts (carried-over plus new findings) drive the
+    policy so an unfixed bug from an earlier round still fails fail_on=bugs.
+    """
     policy = parse_fail_on(fail_on)
+    bug_count = result.bug_count if open_bug_count is None else open_bug_count
+    issue_count = result.issue_count if open_issue_count is None else open_issue_count
     if result.verdict == "error":
         return True
     if policy == "never":
         return False
     if policy == "bugs":
-        return result.bug_count > 0
-    return result.verdict in {"issues", "partial"} or result.issue_count > 0
+        return bug_count > 0
+    return result.verdict in {"issues", "partial"} or issue_count > 0
 
 
 def parse_grok_output(raw: str, *, exit_code: int = 0) -> ReviewResult:
@@ -82,10 +109,11 @@ def parse_grok_output(raw: str, *, exit_code: int = 0) -> ReviewResult:
     findings = _extract_findings(text) or _extract_findings(raw)
     summary = ""
     issues: list[Issue] = []
+    resolutions: list[Resolution] = []
     validation_error: str | None = None
     if findings is not None:
         try:
-            summary, issues = _parse_findings(findings)
+            summary, issues, resolutions = _parse_findings(findings)
         except ValueError as exc:
             validation_error = str(exc)
 
@@ -147,6 +175,7 @@ def parse_grok_output(raw: str, *, exit_code: int = 0) -> ReviewResult:
         summary=summary,
         issues=issues,
         stop_reason=stop_reason,
+        resolutions=resolutions,
     )
 
 
@@ -158,13 +187,7 @@ def mark_partial(result: ReviewResult, reason: str) -> ReviewResult:
     combined_reason = (
         f"{result.partial_reason} {new_reason}" if result.partial_reason else new_reason
     )
-    return ReviewResult(
-        verdict="partial",
-        summary=result.summary,
-        issues=result.issues,
-        stop_reason=result.stop_reason,
-        partial_reason=combined_reason,
-    )
+    return replace(result, verdict="partial", partial_reason=combined_reason)
 
 
 def format_review_body(result: ReviewResult, *, scope: str, model: str, run_url: str) -> str:
@@ -177,8 +200,15 @@ def format_review_body_parts(
     scope: str,
     model: str,
     run_url: str,
+    hidden_marker: str | None = None,
+    extra_lines: list[str] | None = None,
 ) -> list[str]:
-    """Render every finding across bounded GitHub bodies without dropping detail."""
+    """Render every finding across bounded GitHub bodies without dropping detail.
+
+    hidden_marker is emitted directly under the heading so body-tail truncation
+    can never cut it; extra_lines land after the metadata block (e.g. the
+    verify-round resolution report).
+    """
     heading = "Grok PR review"
     if result.verdict == "clean":
         heading += " — clean"
@@ -186,19 +216,25 @@ def format_review_body_parts(
         heading += f" — {result.issue_count} issue(s)"
     elif result.verdict == "partial":
         heading += f" — partial ({result.issue_count} issue(s))"
-    first_lines = [
-        f"## {heading}",
-        "",
-        neutralize_mentions(result.summary.strip()) or "Review completed.",
-        "",
-        f"- Scope: `{scope}`",
-        f"- Model: `{model}`",
-        f"- Issues: {result.issue_count} ({result.bug_count} bug-severity)",
-    ]
+    first_lines = [f"## {heading}"]
+    if hidden_marker:
+        first_lines.append(hidden_marker)
+    first_lines.extend(
+        [
+            "",
+            neutralize_mentions(result.summary.strip()) or "Review completed.",
+            "",
+            f"- Scope: `{scope}`",
+            f"- Model: `{model}`",
+            f"- Issues: {result.issue_count} ({result.bug_count} bug-severity)",
+        ]
+    )
     if result.partial_reason:
         first_lines.extend(["", "> [!WARNING]", f"> {neutralize_mentions(result.partial_reason)}"])
     if run_url:
         first_lines.append(f"- Workflow run: {run_url}")
+    if extra_lines:
+        first_lines.extend(["", *extra_lines])
     if not result.issues:
         return [limit_github_body("\n".join(first_lines).rstrip() + "\n")]
 
@@ -305,18 +341,32 @@ def inline_review_comments(result: ReviewResult) -> list[dict[str, Any]]:
     for issue in result.issues:
         if not issue.path or issue.line is None:
             continue
+        marker = f"{finding_marker(issue.id)}\n" if issue.id else ""
         comments.append(
             {
                 "path": issue.path,
                 "line": issue.line,
                 "side": "RIGHT",
                 "body": (
-                    f"**{neutralize_mentions(issue.title)}** (`{issue.severity}`)\n\n"
+                    f"{marker}**{neutralize_mentions(issue.title)}** (`{issue.severity}`)\n\n"
                     f"{neutralize_mentions(issue.detail)}"
                 ),
             }
         )
     return comments
+
+
+def finding_marker(finding_id: str | None) -> str:
+    """Invisible marker tying an inline comment to a ledger finding id."""
+    return f"<!-- grok-finding:{finding_id} -->"
+
+
+def extract_finding_marker(body: str) -> str | None:
+    match = _FINDING_MARKER_RE.search(body)
+    return match.group(1) if match else None
+
+
+_FINDING_MARKER_RE = re.compile(r"<!-- grok-finding:([A-Za-z0-9_-]{1,32}) -->")
 
 
 def _split_envelope(raw: str) -> tuple[dict[str, Any] | None, str]:
@@ -405,7 +455,7 @@ def _looks_like_findings(data: dict[str, Any]) -> bool:
     return "issues" in data or "summary" in data
 
 
-def _parse_findings(findings: dict[str, Any]) -> tuple[str, list[Issue]]:
+def _parse_findings(findings: dict[str, Any]) -> tuple[str, list[Issue], list[Resolution]]:
     summary_value = findings.get("summary")
     if not isinstance(summary_value, str) or not summary_value.strip():
         raise ValueError("summary must be a non-empty string")
@@ -457,7 +507,42 @@ def _parse_findings(findings: dict[str, Any]) -> tuple[str, list[Issue]]:
                 detail=detail.strip(),
             )
         )
-    return summary, issues
+    return summary, issues, _parse_resolutions(findings)
+
+
+def _parse_resolutions(findings: dict[str, Any]) -> list[Resolution]:
+    raw = findings.get("resolutions")
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("resolutions must be an array or absent")
+    if len(raw) > MAX_RESOLUTIONS:
+        raise ValueError(f"resolutions exceeds the limit of {MAX_RESOLUTIONS}")
+    resolutions: list[Resolution] = []
+    for index, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"resolutions[{index}] must be an object")
+        ident = item.get("id")
+        if (
+            not isinstance(ident, str)
+            or not ident.strip()
+            or len(ident.strip()) > MAX_FINDING_ID_LENGTH
+        ):
+            raise ValueError(f"resolutions[{index}].id must be a short non-empty string")
+        status_value = item.get("status")
+        if not isinstance(status_value, str):
+            raise ValueError(f"resolutions[{index}].status must be a string")
+        status = status_value.strip().lower().replace("-", "_").replace(" ", "_")
+        if status not in RESOLUTION_STATUSES:
+            raise ValueError(f"resolutions[{index}].status is invalid")
+        note = item.get("note")
+        if note is not None and not isinstance(note, str):
+            raise ValueError(f"resolutions[{index}].note must be a string or null")
+        note_text = (note or "").strip()
+        if len(note_text) > MAX_DETAIL_LENGTH:
+            raise ValueError(f"resolutions[{index}].note exceeds {MAX_DETAIL_LENGTH} characters")
+        resolutions.append(Resolution(id=ident.strip(), status=status, note=note_text))
+    return resolutions
 
 
 def _valid_review_path(value: str) -> bool:

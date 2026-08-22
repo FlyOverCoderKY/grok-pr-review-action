@@ -158,3 +158,39 @@ def test_status_comment_body_is_bounded() -> None:
     assert github.upsert_status_comment(7, "🔍" * 20_000, None) == 9
     body_arg = next(value for value in github.calls[0][0] if value.startswith("body="))
     assert len(body_arg.removeprefix("body=").encode("utf-8")) <= MAX_GITHUB_BODY_BYTES
+
+
+def test_list_finding_replies_matches_only_replies_to_bot_finding_comments() -> None:
+    github = StubGitHub()
+    github.responses = [
+        json.dumps(
+            [
+                [
+                    {"id": 1, "body": "<!-- grok-finding:r1-1 -->\n**Crash** (`bug`)"},
+                    {
+                        "id": 2,
+                        "in_reply_to_id": 1,
+                        "body": "Not valid: guarded upstream.",
+                        "user": {"login": "codex-agent"},
+                    },
+                    {"id": 3, "in_reply_to_id": 99, "body": "orphan reply"},
+                    {"id": 4, "body": "unrelated top-level review comment"},
+                ]
+            ]
+        )
+    ]
+    replies = github.list_finding_replies(7)
+    assert replies == [("r1-1", "codex-agent", "Not valid: guarded upstream.")]
+
+
+def test_list_review_bodies_flattens_pages_in_order() -> None:
+    github = StubGitHub()
+    github.responses = [
+        json.dumps(
+            [
+                [{"id": 1, "body": "first"}, {"id": 2, "body": None}],
+                [{"id": 3, "body": "second"}],
+            ]
+        )
+    ]
+    assert github.list_review_bodies(7) == ["first", "second"]

@@ -27,6 +27,9 @@ class RecordingGitHub:
     def pr_view(self, number: int) -> dict[str, object]:
         return {"number": number, "headRefOid": self.live_head}
 
+    def list_review_bodies(self, _number: int) -> list[str]:
+        return []
+
     def post_review(
         self,
         _number: int,
@@ -38,6 +41,7 @@ class RecordingGitHub:
             raise GhError("permission denied")
         self.commit_id = commit_id
         self.result = result
+        self.post_kwargs = _kwargs
         return "https://example.test/review"
 
     def post_incomplete(
@@ -259,7 +263,12 @@ def test_collect_command_writes_the_pinned_scope_artifacts(
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
-    monkeypatch.setattr(cli, "_github", object)
+
+    class NoHistoryGitHub:
+        def list_review_bodies(self, _number: int) -> list[str]:
+            return []
+
+    monkeypatch.setattr(cli, "_github", NoHistoryGitHub)
 
     expected = CollectedReview(
         pr={"number": 7, "headRefOid": head},
@@ -553,3 +562,119 @@ def test_update_status_survives_a_status_lookup_failure(tmp_path: Path) -> None:
 
     result = ReviewResult(verdict="clean", summary="ok")
     cli._update_status(LookupFails(), tmp_path, 7, result, "full-pr", "", enabled=True)
+
+
+def test_finish_verify_round_reports_resolutions_and_open_counts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grok_pr_review.loop import LedgerFinding, LoopState, extract_ledger
+
+    _write_completed_run(tmp_path)
+    envelope = {
+        "text": json.dumps(
+            {
+                "summary": "Verified the fixes.",
+                "issues": [],
+                "resolutions": [
+                    {"id": "r1-1", "status": "not_fixed", "note": "still crashes"},
+                    {"id": "r1-2", "status": "fixed", "note": "resolved"},
+                ],
+            }
+        ),
+        "stopReason": "EndTurn",
+    }
+    (tmp_path / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
+    ReviewContext(
+        pr={"number": 7, "headRefOid": REVIEWED_SHA},
+        plan=DiffPlan("full-pr", "full-pr", None, REVIEWED_SHA, None),
+        truncated=False,
+        original_bytes=1,
+        embedded_bytes=1,
+        max_diff_kb=300,
+        loop=LoopState(
+            mode="verify",
+            round_number=2,
+            severity_floor="risk",
+            escalated=False,
+            retired=1,
+            prior_findings=(
+                LedgerFinding("r1-1", "bug", "src/app.py", 3, "Crash on save", "open"),
+                LedgerFinding("r1-2", "risk", None, None, "Race in setup", "open"),
+            ),
+        ),
+    ).write(tmp_path / "review-context.json")
+    output = _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 0
+    assert github.result is not None
+    assert github.result.verdict == "issues"
+    written = output.read_text(encoding="utf-8")
+    assert "verdict=issues" in written
+    assert "issue_count=1" in written
+    assert "bug_count=1" in written
+    assert "round=2" in written
+    ledger = extract_ledger(github.post_kwargs["hidden_marker"])
+    assert ledger is not None
+    assert {finding.id for finding in ledger.findings} == {"r1-1"}
+    report = "\n".join(github.post_kwargs["extra_lines"])
+    assert "Round 2 resolution" in report
+    assert "`r1-1` not fixed" in report
+    assert "still crashes" in report
+
+
+def test_collect_verify_round_reads_ledger_and_stages_verify_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grok_pr_review.loop import Ledger, LedgerFinding, encode_ledger
+
+    head = "a" * 40
+    work = tmp_path / "work"
+    for name, value in {
+        "WORK": str(work),
+        "PR_NUMBER": "7",
+        "REVIEW_SCOPE": "latest-commit",
+        "MAX_DIFF_KB": "300",
+        "HEAD_SHA": head,
+        "EVENT_ACTION": "synchronize",
+        "VERIFY_MODEL": "grok-4-fast",
+        "VERIFY_EFFORT": "low",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+
+    prior = encode_ledger(
+        Ledger(1, (LedgerFinding("r1-1", "bug", "src/app.py", 3, "Crash", "open"),))
+    )
+
+    class LoopGitHub:
+        def list_review_bodies(self, _number: int) -> list[str]:
+            return [f"## Grok PR review\n{prior}\n"]
+
+        def list_finding_replies(self, _number: int) -> list[tuple[str, str, str]]:
+            return [("r1-1", "codex-agent", "Not a real issue.")]
+
+        def list_recent_issue_comments(self, _number: int) -> list[tuple[str, str]]:
+            return [("nathan", "Please re-check the retry path.")]
+
+    monkeypatch.setattr(cli, "_github", LoopGitHub)
+    collected = CollectedReview(
+        pr={"number": 7, "headRefOid": head},
+        plan=DiffPlan("latest-commit", "single-commit", None, head, None),
+        truncation=Truncation("diff --git a/a b/a\n+x\n", False, 22, 22, 300),
+    )
+    monkeypatch.setattr(cli, "collect_review_material", lambda **_kwargs: collected)
+
+    assert cli.cmd_collect() == 0
+    context = ReviewContext.read(work / "review-context.json")
+    assert context.loop is not None
+    assert context.loop.mode == "verify"
+    assert context.loop.round_number == 2
+    assert context.loop.severity_floor == "risk"
+    assert [finding.id for finding in context.loop.prior_findings] == ["r1-1"]
+    assert (work / "model-override").read_text(encoding="utf-8") == "grok-4-fast"
+    assert (work / "effort-override").read_text(encoding="utf-8") == "low"
+    replies = (work / "agent-replies.md").read_text(encoding="utf-8")
+    assert "Reply to finding r1-1 (from codex-agent):" in replies
+    assert "PR comment (from nathan):" in replies

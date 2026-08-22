@@ -88,3 +88,31 @@ def test_required_pr_number_and_github_token_are_checked_up_front() -> None:
         ActionConfig.from_env({"GITHUB_TOKEN": "test-token"})
     with pytest.raises(ConfigError, match="github_token"):
         ActionConfig.from_env({"PR_NUMBER": "1"})
+
+
+def test_review_loop_inputs_parse_and_validate() -> None:
+    import pytest
+
+    from grok_pr_review.config import (
+        ConfigError,
+        parse_optional_model,
+        parse_review_mode,
+        parse_severity_schedule,
+    )
+
+    assert parse_review_mode("") == "auto"
+    assert parse_review_mode("VERIFY") == "verify"
+    with pytest.raises(ConfigError):
+        parse_review_mode("loop")
+
+    assert parse_severity_schedule("nit, risk, bug") == ("nit", "risk", "bug")
+    assert parse_severity_schedule("bug") == ("bug",)
+    with pytest.raises(ConfigError):
+        parse_severity_schedule("nit,ultra")
+    with pytest.raises(ConfigError):
+        parse_severity_schedule(",,")
+
+    assert parse_optional_model("") == ""
+    assert parse_optional_model("grok-4-fast") == "grok-4-fast"
+    with pytest.raises(ConfigError):
+        parse_optional_model("bad name!")

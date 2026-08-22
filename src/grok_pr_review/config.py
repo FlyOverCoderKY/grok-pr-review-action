@@ -12,14 +12,21 @@ from grok_pr_review.scope import ScopeName, parse_scope
 Effort = Literal["", "low", "medium", "high", "xhigh"]
 FailOn = Literal["never", "bugs", "any"]
 RoastLevel = Literal["professional", "playful", "savage", "diabolical"]
+ReviewMode = Literal["auto", "initial", "verify"]
+Severity = Literal["nit", "risk", "bug"]
 
 DEFAULT_MODEL = "grok-4.6"
 DEFAULT_GITHUB_TIMEOUT_SECONDS = 120
+DEFAULT_SEVERITY_SCHEDULE = "nit,risk,bug"
+DEFAULT_VERIFY_ESCALATION_LINES = 500
 MAX_CUSTOM_INSTRUCTIONS_BYTES = 16_000
 MAX_DIFF_KB = 10_240
 MAX_GITHUB_TIMEOUT_SECONDS = 600
+MAX_SEVERITY_SCHEDULE_ROUNDS = 8
 MAX_TURNS = 1_000
+MAX_VERIFY_ESCALATION_LINES = 100_000
 ROAST_LEVELS = ("professional", "playful", "savage", "diabolical")
+SEVERITIES = ("nit", "risk", "bug")
 UNPROFESSIONAL_ROAST_LEVELS = {"savage", "diabolical"}
 
 _MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
@@ -45,6 +52,11 @@ class ActionConfig:
     max_diff_kb: int
     review_scope: ScopeName
     github_timeout_seconds: int
+    review_mode: ReviewMode
+    severity_schedule: tuple[Severity, ...]
+    verify_model: str
+    verify_effort: Effort
+    verify_escalation_lines: int
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> ActionConfig:
@@ -86,6 +98,18 @@ class ActionConfig:
                 minimum=1,
                 maximum=MAX_GITHUB_TIMEOUT_SECONDS,
             ),
+            review_mode=parse_review_mode(env.get("REVIEW_MODE", "auto")),
+            severity_schedule=parse_severity_schedule(
+                env.get("SEVERITY_SCHEDULE", DEFAULT_SEVERITY_SCHEDULE)
+            ),
+            verify_model=parse_optional_model(env.get("VERIFY_MODEL", "")),
+            verify_effort=parse_effort(env.get("VERIFY_EFFORT", "")),
+            verify_escalation_lines=parse_bounded_int(
+                env.get("VERIFY_ESCALATION_LINES", str(DEFAULT_VERIFY_ESCALATION_LINES)),
+                "verify_escalation_lines",
+                minimum=1,
+                maximum=MAX_VERIFY_ESCALATION_LINES,
+            ),
         )
 
 
@@ -96,6 +120,38 @@ def parse_model(value: str) -> str:
             "model must be a 1-200 character identifier starting with an ASCII letter or digit"
         )
     return chosen
+
+
+def parse_optional_model(value: str) -> str:
+    chosen = value.strip()
+    if not chosen:
+        return ""
+    return parse_model(chosen)
+
+
+def parse_review_mode(value: str) -> ReviewMode:
+    chosen = value.strip().lower() or "auto"
+    if chosen not in {"auto", "initial", "verify"}:
+        raise ConfigError("review_mode must be auto, initial, or verify")
+    return cast(ReviewMode, chosen)
+
+
+def parse_severity(value: str) -> Severity:
+    chosen = value.strip().lower()
+    if chosen not in SEVERITIES:
+        raise ConfigError("severity must be nit, risk, or bug")
+    return cast(Severity, chosen)
+
+
+def parse_severity_schedule(value: str) -> tuple[Severity, ...]:
+    entries = [entry for entry in (part.strip() for part in value.split(",")) if entry]
+    if not entries:
+        raise ConfigError("severity_schedule must contain at least one severity")
+    if len(entries) > MAX_SEVERITY_SCHEDULE_ROUNDS:
+        raise ConfigError(
+            f"severity_schedule cannot list more than {MAX_SEVERITY_SCHEDULE_ROUNDS} rounds"
+        )
+    return tuple(parse_severity(entry) for entry in entries)
 
 
 def parse_effort(value: str) -> Effort:

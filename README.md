@@ -117,15 +117,31 @@ Until a `v1` tag exists, pin a commit SHA or the branch you merged.
 | `status_comments` | `true` | Live “Grokking this…” comment. |
 | `max_diff_kb` | `300` | Embedded diff cap, with a truncation notice. |
 | `review_scope` | `full-pr` | `full-pr` \| `latest-commit`. |
+| `review_mode` | `auto` | Loop position: `auto` (opened = initial round, synchronize = verify round), or force `initial` \| `verify`. |
+| `severity_schedule` | `nit,risk,bug` | Severity floor per round, comma-separated; the last entry repeats. Default: everything in round 1, bugs+risks in round 2, bugs only from round 3. |
+| `verify_model` | _empty_ | Optional cheaper model for verify rounds. |
+| `verify_effort` | _empty_ | Optional effort override for verify rounds. |
+| `verify_escalation_lines` | `500` | A verify push changing more lines than this gets a full-severity review with the primary model. |
 
 ## Outputs
 
 | Output | Meaning |
 | --- | --- |
 | `verdict` | `clean` \| `issues` \| `partial` \| `error` |
-| `issue_count` | Structured findings |
-| `bug_count` | Findings with `severity: bug` |
+| `issue_count` | Open findings after this round (carried-over plus new) |
+| `bug_count` | Open `severity: bug` findings after this round |
+| `round` | Review-loop round number this run performed |
 | `review_url` | Posted GitHub review, or the incomplete-review comment |
+
+## The review loop
+
+The action is built for an agentic PR loop: review → agent fixes → re-review, until clean.
+
+**Round 1 (initial, on `opened`)** is deliberately exhaustive and recall-biased. The prompt tells Grok its findings are adjudicated by an automated fixing agent, not read by a human, so it should report every issue it can name a failure scenario for — bugs, risks, and nits — sweep the diff repeatedly until a sweep finds nothing new, and account for every file in a coverage manifest. Expect the finding count to be front-loaded: a thorough round 1 is cheaper than five shallow rounds.
+
+**Rounds 2+ (verify, on `synchronize`)** are convergence rounds. The bot reads its own prior review, re-lists the open findings, and asks Grok to verdict each one — `fixed`, `not_fixed`, `fixed_incorrectly`, or `disputed` — using the fix commits and the fixing agent's comment-thread replies as evidence. A reasoned rebuttal settles a finding as disputed; it is never re-raised without new evidence. New findings are accepted only in code the fix commits touched, at or above the round's severity floor from `severity_schedule` — so by round 3 (default) a nit about comment phrasing is structurally unreportable. A verify push changing more than `verify_escalation_lines` lines escalates to a full-severity review automatically, because a massive mid-loop change means the loop is off the rails.
+
+State lives in a hidden, base64-encoded ledger inside the bot's own review bodies — the fixing agent needs no bot-specific protocol, so this action coexists with other review bots. Dispositions come only from commits and ordinary GitHub comment replies. `issue_count`/`bug_count` outputs report **open** findings including unfixed carry-overs, so an agent loop should iterate until `bug_count` is `0` (or `issue_count`, if it chases risks too). Use `verify_model`/`verify_effort` to run verify rounds on a cheaper tier — verifying a fix is a much easier task than finding the issue was. Forcing `review_mode: initial` (or any `workflow_dispatch` run) resets the loop with a fresh exhaustive review.
 
 Grok runs headless with `--prompt-file` and JSON output. Tools are allowlisted to `read_file`, `grep`, and `list_dir`. There is no shell tool. `--yolo` only auto-approves those read-only tools.
 

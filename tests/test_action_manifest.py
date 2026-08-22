@@ -25,6 +25,12 @@ def test_action_yml_uses_xai_api_key_not_supergrok() -> None:
     assert text.index("Validate inputs") < text.index("Require XAI_API_KEY")
     assert "github_timeout_seconds" in text
     assert "allow_unprofessional_tone" in text
+    assert "review_mode" in text
+    assert "severity_schedule" in text
+    assert "verify_model" in text
+    assert "verify_escalation_lines" in text
+    assert "model-override" in text
+    assert "steps.finish.outputs.round" in text
     assert "prepare-workspace" in text
     assert "scripts/install-grok.sh" in text
     assert "scripts/run-grok.sh" in text
@@ -52,3 +58,5 @@ def test_readme_explains_latest_commit_and_auth() -> None:
     assert "requests and responses are retained for 30 days by default" in text
     assert "allow_unprofessional_tone" in text
     assert "Operational errors always fail" in text
+    assert "## The review loop" in text
+    assert "severity floor" in text

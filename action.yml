@@ -63,17 +63,48 @@ inputs:
       full PR diff.
     required: false
     default: "full-pr"
+  review_mode:
+    description: >-
+      Loop position: auto (opened = exhaustive initial round, synchronize =
+      fix-verification round), or force initial / verify.
+    required: false
+    default: "auto"
+  severity_schedule:
+    description: >-
+      Comma-separated severity floor per round (last entry repeats). The
+      default nit,risk,bug reports everything in round 1, bugs and risks in
+      round 2, and bugs only from round 3 on.
+    required: false
+    default: "nit,risk,bug"
+  verify_model:
+    description: "Optional cheaper model for verify rounds (defaults to model)."
+    required: false
+    default: ""
+  verify_effort:
+    description: "Optional effort override for verify rounds (defaults to effort)."
+    required: false
+    default: ""
+  verify_escalation_lines:
+    description: >-
+      A verify-round push whose diff changes more lines than this gets a
+      full-severity review with the primary model instead of a
+      fix-verification pass.
+    required: false
+    default: "500"
 
 outputs:
   verdict:
     description: "Review verdict: clean | issues | partial | error"
     value: ${{ steps.finish.outputs.verdict }}
   issue_count:
-    description: "Total number of issues found."
+    description: "Open findings after this round (carried-over plus new)."
     value: ${{ steps.finish.outputs.issue_count }}
   bug_count:
-    description: "Number of bug-severity issues found."
+    description: "Open bug-severity findings after this round."
     value: ${{ steps.finish.outputs.bug_count }}
+  round:
+    description: "Review-loop round number this run performed."
+    value: ${{ steps.finish.outputs.round }}
   review_url:
     description: "URL of the posted GitHub review or incomplete-review comment."
     value: ${{ steps.finish.outputs.review_url }}
@@ -107,6 +138,11 @@ runs:
         MAX_DIFF_KB: ${{ inputs.max_diff_kb }}
         REVIEW_SCOPE: ${{ inputs.review_scope }}
         GITHUB_TIMEOUT_SECONDS: ${{ inputs.github_timeout_seconds }}
+        REVIEW_MODE: ${{ inputs.review_mode }}
+        SEVERITY_SCHEDULE: ${{ inputs.severity_schedule }}
+        VERIFY_MODEL: ${{ inputs.verify_model }}
+        VERIFY_EFFORT: ${{ inputs.verify_effort }}
+        VERIFY_ESCALATION_LINES: ${{ inputs.verify_escalation_lines }}
       run: python3 -m grok_pr_review validate-inputs
 
     - name: Require XAI_API_KEY
@@ -127,6 +163,7 @@ runs:
         PYTHONPATH: ${{ github.action_path }}/src
         GROK_HOME: ${{ steps.dirs.outputs.grok_home }}
         MODEL: ${{ inputs.model }}
+        VERIFY_MODEL: ${{ inputs.verify_model }}
       run: python3 -m grok_pr_review write-config
 
     - name: Collect PR context
@@ -145,6 +182,12 @@ runs:
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         GITHUB_TIMEOUT_SECONDS: ${{ inputs.github_timeout_seconds }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        EVENT_ACTION: ${{ github.event.action }}
+        REVIEW_MODE: ${{ inputs.review_mode }}
+        SEVERITY_SCHEDULE: ${{ inputs.severity_schedule }}
+        VERIFY_MODEL: ${{ inputs.verify_model }}
+        VERIFY_EFFORT: ${{ inputs.verify_effort }}
+        VERIFY_ESCALATION_LINES: ${{ inputs.verify_escalation_lines }}
       run: python3 -m grok_pr_review collect
 
     - name: Prepare isolated review workspace
@@ -197,6 +240,9 @@ runs:
         MAX_TURNS: ${{ inputs.max_turns }}
         GROK_DISABLE_AUTOUPDATER: "1"
       run: |
+        if [ -s "$WORK/model-override" ]; then MODEL="$(cat "$WORK/model-override")"; fi
+        if [ -s "$WORK/effort-override" ]; then EFFORT="$(cat "$WORK/effort-override")"; fi
+        export MODEL EFFORT
         bash "${{ github.action_path }}/scripts/run-grok.sh" \
           "$WORK/bin/grok" \
           "$WORK/prompt.md" \
