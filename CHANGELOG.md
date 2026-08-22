@@ -4,6 +4,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## Unreleased
 
+### Fixed
+
+- Install `bubblewrap` (`bwrap`) on Linux before invoking the Grok CLI so GitHub-hosted Ubuntu runners can enforce the strict sandbox deny list. If `bwrap` is already present the install is skipped; if it cannot be installed the action still fails closed. Self-hosted Linux runners must provide `bwrap` or allow `sudo apt-get install -y bubblewrap`. There is no production switch to disable the sandbox.
+
 ## [1.0.0] - 2026-08-22
 
 First stable release. Immutable `v1.0.0` is tagged and smoke-tested before the movable `v1` alias follows (see [RELEASING.md](RELEASING.md)).
