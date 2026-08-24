@@ -55,9 +55,9 @@ from grok_pr_review.result import (
     mark_partial,
     neutralize_mentions,
     parse_grok_output,
+    paths_outside_embed,
     should_fail_job,
     validate_coverage,
-    validate_issue_paths,
 )
 from grok_pr_review.scope import (
     CollectedReview,
@@ -378,6 +378,7 @@ def cmd_finish() -> int:
     context = ReviewContext.read(work / "review-context.json")
     result = _parse_finish_result(work, context)
     loop_outcome: RoundOutcome | None = None
+    diff_paths: set[str] = set()
     if not result.incomplete:
         state = context.loop or build_loop_state(
             mode="initial",
@@ -388,9 +389,9 @@ def cmd_finish() -> int:
         )
         diff = _read_optional(work / "diff.patch")
         diff_paths = changed_paths(diff)
-        validation_error = validate_issue_paths(result, diff_paths)
-        if validation_error is None and state.mode == "initial":
-            validation_error = validate_coverage(result, diff_paths)
+        validation_error = (
+            validate_coverage(result, diff_paths) if state.mode == "initial" else None
+        )
         if validation_error:
             result = ReviewResult(
                 verdict="error",
@@ -402,6 +403,14 @@ def cmd_finish() -> int:
                 stop_reason=result.stop_reason,
             )
         else:
+            if context.truncated:
+                omitted = paths_outside_embed(result, diff_paths)
+                if omitted:
+                    named = ", ".join(omitted[:5])
+                    result = mark_partial(
+                        result,
+                        f"Findings cite file(s) omitted from the truncated embed: {named}",
+                    )
             loop_outcome = apply_round(state, result)
             result = loop_outcome.result
     github = _github()
@@ -414,6 +423,7 @@ def cmd_finish() -> int:
         model=model_used,
         run_url=run_url,
         loop_outcome=loop_outcome,
+        inline_paths=diff_paths,
     )
     return _finalize_finish(
         github,
@@ -459,6 +469,7 @@ def _post_finish_result(
     model: str,
     run_url: str,
     loop_outcome: RoundOutcome | None = None,
+    inline_paths: set[str] | None = None,
 ) -> FinishOutcome:
     review_url = ""
     try:
@@ -502,6 +513,7 @@ def _post_finish_result(
                 run_url=run_url,
                 hidden_marker=hidden_marker,
                 extra_lines=loop_outcome.extra_lines if loop_outcome else None,
+                inline_paths=inline_paths,
             )
     except GhError as exc:
         reason = f"Failed to post PR feedback: {exc}"

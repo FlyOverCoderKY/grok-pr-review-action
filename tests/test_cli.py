@@ -768,8 +768,147 @@ def test_initial_finish_fails_closed_when_coverage_is_missing_or_wrong(
     assert github.result is not None
     assert github.result.verdict == "clean"
 
+    mismatch = {
+        "text": json.dumps(
+            {
+                "summary": "Claimed count does not match listed findings.",
+                "issues": [
+                    {
+                        "severity": "bug",
+                        "path": "src/app.py",
+                        "line": 3,
+                        "title": "Crash",
+                        "detail": "In the diff.",
+                    },
+                    {
+                        "severity": "nit",
+                        "path": "DOCS/README.md",
+                        "line": 1,
+                        "title": "Stale",
+                        "detail": "Docs were not edited.",
+                    },
+                ],
+                "coverage": [{"path": "src/app.py", "findings": 2}],
+            }
+        ),
+        "stopReason": "EndTurn",
+    }
+    (tmp_path / "grok-output.json").write_text(json.dumps(mismatch), encoding="utf-8")
+    assert cli.cmd_finish() == 1
+    broken = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert broken["verdict"] == "error"
+    assert "claims 2" in broken["incomplete_reason"]
 
-def test_verify_finish_rejects_new_findings_outside_the_embedded_diff(
+
+def test_initial_finish_keeps_findings_outside_the_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    diff = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n+x\n"
+    envelope = {
+        "text": json.dumps(
+            {
+                "summary": "One in-diff bug and two stale-doc nits.",
+                "issues": [
+                    {
+                        "severity": "bug",
+                        "path": "src/app.py",
+                        "line": 3,
+                        "title": "Off-by-one",
+                        "detail": "Loop walks one past the buffer.",
+                    },
+                    {
+                        "severity": "nit",
+                        "path": "DOCS/README.md",
+                        "line": 12,
+                        "title": "Stale README",
+                        "detail": "README still documents the old move path.",
+                    },
+                    {
+                        "severity": "nit",
+                        "path": "DOCS/code-map.md",
+                        "line": 4,
+                        "title": "Stale code map",
+                        "detail": "Code map does not mention the new helper.",
+                    },
+                ],
+                "coverage": [{"path": "src/app.py", "findings": 1}],
+            }
+        ),
+        "stopReason": "EndTurn",
+    }
+    (tmp_path / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
+    (tmp_path / "grok-exit").write_text("0", encoding="utf-8")
+    (tmp_path / "diff.patch").write_text(diff, encoding="utf-8")
+    diff_bytes = len(diff.encode("utf-8"))
+    ReviewContext(
+        pr={"number": 7, "headRefOid": REVIEWED_SHA},
+        plan=DiffPlan("full-pr", "full-pr", None, REVIEWED_SHA, None),
+        truncated=False,
+        original_bytes=diff_bytes,
+        embedded_bytes=diff_bytes,
+        max_diff_kb=300,
+    ).write(tmp_path / "review-context.json")
+    _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 0
+    assert github.incomplete_result is None
+    assert github.result is not None
+    assert github.result.verdict == "issues"
+    assert [issue.path for issue in github.result.issues] == [
+        "src/app.py",
+        "DOCS/README.md",
+        "DOCS/code-map.md",
+    ]
+
+
+def test_initial_finish_keeps_truncated_out_of_embed_findings_as_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    diff = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n+x\n"
+    envelope = {
+        "text": json.dumps(
+            {
+                "summary": "Finding on a PR file the 300 KB embed omitted.",
+                "issues": [
+                    {
+                        "severity": "risk",
+                        "path": "src/main/library/windows-durable-move.ts",
+                        "line": 40,
+                        "title": "Move is not durable",
+                        "detail": "The helper can leave a partial file after a crash.",
+                    }
+                ],
+                "coverage": [{"path": "src/app.py", "findings": 0}],
+            }
+        ),
+        "stopReason": "EndTurn",
+    }
+    (tmp_path / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
+    (tmp_path / "grok-exit").write_text("0", encoding="utf-8")
+    (tmp_path / "diff.patch").write_text(diff, encoding="utf-8")
+    ReviewContext(
+        pr={"number": 7, "headRefOid": REVIEWED_SHA},
+        plan=DiffPlan("full-pr", "full-pr", None, REVIEWED_SHA, None),
+        truncated=True,
+        original_bytes=611_000,
+        embedded_bytes=len(diff.encode("utf-8")),
+        max_diff_kb=300,
+    ).write(tmp_path / "review-context.json")
+    _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 0
+    assert github.incomplete_result is None
+    assert github.result is not None
+    assert github.result.verdict == "partial"
+    assert github.result.issues[0].path == "src/main/library/windows-durable-move.ts"
+    assert "omitted from the truncated embed" in (github.result.partial_reason or "")
+
+
+def test_verify_finish_keeps_new_findings_outside_the_embedded_diff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from grok_pr_review.loop import LoopState
@@ -817,9 +956,11 @@ def test_verify_finish_rejects_new_findings_outside_the_embedded_diff(
     github = RecordingGitHub()
     monkeypatch.setattr(cli, "_github", lambda: github)
 
-    assert cli.cmd_finish() == 1
-    assert github.incomplete_result is not None
-    assert "outside the embedded diff" in (github.incomplete_result.incomplete_reason or "")
+    assert cli.cmd_finish() == 0
+    assert github.incomplete_result is None
+    assert github.result is not None
+    assert github.result.verdict == "issues"
+    assert github.result.issues[0].path == "src/unchanged.py"
 
 
 def test_forced_verify_without_state_and_corrupted_ledgers_fail_visibly(

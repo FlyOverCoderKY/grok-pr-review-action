@@ -342,10 +342,14 @@ def _chunk_issue_bodies(
     return bodies
 
 
-def inline_review_comments(result: ReviewResult) -> list[dict[str, Any]]:
+def inline_review_comments(
+    result: ReviewResult, *, allowed_paths: set[str] | None = None
+) -> list[dict[str, Any]]:
     comments: list[dict[str, Any]] = []
     for issue in result.issues:
         if not issue.path or issue.line is None:
+            continue
+        if allowed_paths is not None and issue.path not in allowed_paths:
             continue
         marker = f"{finding_marker(issue.id)}\n" if issue.id else ""
         comments.append(
@@ -545,22 +549,26 @@ def _parse_coverage(findings: dict[str, Any]) -> list[tuple[str, int]]:
     return entries
 
 
-def validate_issue_paths(result: ReviewResult, diff_paths: set[str]) -> str | None:
-    """Reject findings assigned to files outside the embedded diff."""
-    stray = sorted(
+def paths_outside_embed(result: ReviewResult, diff_paths: set[str]) -> list[str]:
+    """Finding paths that are not in the embedded diff.
+
+    Out-of-embed citations are valid: Grok may report blast-radius or stale-doc
+    issues in files the change did not edit, and a truncated embed may omit PR
+    files that still belong in the review. Callers must not treat these as a
+    parse error.
+    """
+    return sorted(
         {issue.path for issue in result.issues if issue.path and issue.path not in diff_paths}
     )
-    if stray:
-        named = ", ".join(stray[:5])
-        return f"findings reference file(s) outside the embedded diff: {named}"
-    return None
 
 
 def validate_coverage(result: ReviewResult, diff_paths: set[str]) -> str | None:
-    """Reject an initial review whose coverage manifest does not account for the diff."""
-    issue_path_error = validate_issue_paths(result, diff_paths)
-    if issue_path_error:
-        return issue_path_error
+    """Reject an initial review whose coverage manifest does not account for the embed.
+
+    Coverage is required only for files that appear in the embedded diff.
+    Findings on other paths are kept and do not fail this check. Per-file
+    counts must still match the findings kept for each embedded-diff file.
+    """
     if not diff_paths:
         return None
     covered = dict(result.coverage)
@@ -576,7 +584,7 @@ def validate_coverage(result: ReviewResult, diff_paths: set[str]) -> str | None:
         return f"coverage lists file(s) not in the embedded diff: {named}"
     reported: dict[str, int] = {}
     for issue in result.issues:
-        if issue.path:
+        if issue.path and issue.path in diff_paths:
             reported[issue.path] = reported.get(issue.path, 0) + 1
     for path, count in covered.items():
         if reported.get(path, 0) != count:

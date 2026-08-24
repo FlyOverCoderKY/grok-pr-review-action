@@ -4,6 +4,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## Unreleased
 
+### Changed
+
+- Findings that cite files outside the embedded diff are no longer rejected as invalid structured output. Blast-radius and stale-doc nits (files not edited in the PR) are posted with the rest of the review. Findings on PR files omitted by `max_diff_kb` truncation still keep the review `partial`. Coverage remains required for every embedded-diff file, and per-file coverage counts must still match the findings kept for those files.
+
 ### Added
 
 - Document recommended caller concurrency: isolate first-pass (`full-pr` on `opened` / `reopened` / `ready_for_review` / `workflow_dispatch`) from synchronize follow-ups (`latest-commit`) so hot-push loops do not cancel the opening review or burn tokens on cancelled follow-ups. Optional merge gates should stay green only after first-pass landed. Concurrency and merge gating belong in the org reusable caller; this action still runs a single review.
