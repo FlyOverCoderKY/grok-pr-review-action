@@ -301,18 +301,72 @@ def test_inline_comments_carry_extractable_finding_markers() -> None:
     assert extract_finding_marker("no marker") is None
 
 
-def test_coverage_rejects_findings_outside_the_embedded_diff() -> None:
+def test_coverage_allows_findings_outside_the_embedded_diff() -> None:
+    from grok_pr_review.result import paths_outside_embed, validate_coverage
+
+    result = ReviewResult(
+        verdict="issues",
+        summary="In-diff bug plus stale docs.",
+        issues=[
+            Issue("bug", "src/app.py", 3, "Crash", "In the diff."),
+            Issue("nit", "DOCS/README.md", 1, "Stale README", "Docs were not edited."),
+            Issue("nit", "DOCS/code-map.md", 4, "Stale map", "Map still names the old API."),
+        ],
+        coverage=[("src/app.py", 1)],
+    )
+    assert validate_coverage(result, {"src/app.py"}) is None
+    assert paths_outside_embed(result, {"src/app.py"}) == [
+        "DOCS/README.md",
+        "DOCS/code-map.md",
+    ]
+
+
+def test_coverage_still_rejects_count_mismatches_with_extra_diff_findings() -> None:
     from grok_pr_review.result import validate_coverage
 
     result = ReviewResult(
         verdict="issues",
-        summary="One stray.",
-        issues=[Issue("bug", "src/other.py", 3, "Stray", "Outside the diff.")],
-        coverage=[("src/app.py", 0)],
+        summary="Claimed count does not match listed embed findings.",
+        issues=[
+            Issue("bug", "src/app.py", 3, "Crash", "In the diff."),
+            Issue("nit", "DOCS/README.md", 1, "Stale README", "Docs were not edited."),
+        ],
+        coverage=[("src/app.py", 2)],
     )
     error = validate_coverage(result, {"src/app.py"})
     assert error is not None
-    assert "outside the embedded diff" in error
+    assert "claims 2" in error
+    assert "1 were reported" in error
+
+
+def test_coverage_still_requires_every_embedded_diff_file() -> None:
+    from grok_pr_review.result import validate_coverage
+
+    result = ReviewResult(
+        verdict="issues",
+        summary="Missed an embed file.",
+        issues=[Issue("nit", "DOCS/README.md", 1, "Stale", "Outside the PR.")],
+        coverage=[("src/app.py", 0)],
+    )
+    error = validate_coverage(result, {"src/app.py", "src/other.py"})
+    assert error is not None
+    assert "does not account" in error
+    assert "src/other.py" in error
+
+
+def test_inline_comments_skip_paths_outside_the_embed() -> None:
+    from grok_pr_review.result import inline_review_comments
+
+    result = ReviewResult(
+        verdict="issues",
+        summary="One in-diff, one blast-radius.",
+        issues=[
+            Issue("bug", "src/app.py", 3, "Crash", "Boom.", id="r1-1"),
+            Issue("nit", "DOCS/README.md", 1, "Stale", "Update the docs.", id="r1-2"),
+        ],
+    )
+    comments = inline_review_comments(result, allowed_paths={"src/app.py"})
+    assert [comment["path"] for comment in comments] == ["src/app.py"]
 
 
 def test_resolution_capacity_matches_the_maximum_ledger_backlog() -> None:

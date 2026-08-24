@@ -217,6 +217,7 @@ class GitHubCli:
         run_url: str,
         hidden_marker: str | None = None,
         extra_lines: list[str] | None = None,
+        inline_paths: set[str] | None = None,
     ) -> str:
         bodies = format_review_body_parts(
             result,
@@ -227,7 +228,7 @@ class GitHubCli:
             extra_lines=extra_lines,
         )
         body = bodies[0]
-        comments = inline_review_comments(result)
+        comments = inline_review_comments(result, allowed_paths=inline_paths)
         payload: dict[str, Any] = {
             "commit_id": commit_id,
             "body": body,
