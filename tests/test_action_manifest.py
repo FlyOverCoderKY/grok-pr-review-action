@@ -103,7 +103,11 @@ def test_readme_explains_latest_commit_and_auth() -> None:
 
 def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert text.index("## Unreleased") < text.index("## [1.0.0] - 2026-08-22")
+    assert text.index("## Unreleased") < text.index("## [1.0.4] - 2026-08-24")
+    assert text.index("## [1.0.4] - 2026-08-24") < text.index("## [1.0.3] - 2026-08-22")
+    assert text.index("## [1.0.3] - 2026-08-22") < text.index("## [1.0.2] - 2026-08-22")
+    assert text.index("## [1.0.2] - 2026-08-22") < text.index("## [1.0.1] - 2026-08-22")
+    assert text.index("## [1.0.1] - 2026-08-22") < text.index("## [1.0.0] - 2026-08-22")
     assert "tagged and smoke-tested" in text
     assert "coverage manifest" in text
     assert "severity_schedule" in text
@@ -111,13 +115,15 @@ def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     assert "fixed_incorrectly" in text
     assert "verify_model" in text
     assert "review_mode" in text
-    unreleased = text.split("## [1.0.0]", 1)[0]
-    assert "bubblewrap" in unreleased
-    assert "apparmor_restrict_unprivileged_userns" in unreleased
-    assert "bwrap-userns-restrict" in unreleased
-    assert "v1.0.2" in unreleased
-    assert "v1.0.3" in unreleased
-    assert ".grok-pr-review/prompt.md" in unreleased
-    assert "Permission denied (os error 13)" in unreleased
-    assert "recommended caller concurrency" in unreleased
-    assert "org reusable caller" in unreleased
+    unreleased, rest = text.split("## [1.0.4]", 1)
+    assert "###" not in unreleased.split("## Unreleased", 1)[1]
+    v104 = rest.split("## [1.0.3]", 1)[0]
+    assert "outside the embedded diff" in v104
+    assert "recommended caller concurrency" in v104
+    assert "org reusable caller" in v104
+    patches = rest.split("## [1.0.0]", 1)[0]
+    assert "bubblewrap" in patches
+    assert "apparmor_restrict_unprivileged_userns" in patches
+    assert "bwrap-userns-restrict" in patches
+    assert ".grok-pr-review/prompt.md" in patches
+    assert "Permission denied (os error 13)" in patches

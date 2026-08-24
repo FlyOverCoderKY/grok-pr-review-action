@@ -4,6 +4,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## Unreleased
 
+## [1.0.4] - 2026-08-24
+
 ### Changed
 
 - Findings that cite files outside the embedded diff are no longer rejected as invalid structured output. Blast-radius and stale-doc nits (files not edited in the PR) are posted with the rest of the review. Findings on PR files omitted by `max_diff_kb` truncation still keep the review `partial`. Coverage remains required for every embedded-diff file, and per-file coverage counts must still match the findings kept for those files.
@@ -12,11 +14,23 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 - Document recommended caller concurrency: isolate first-pass (`full-pr` on `opened` / `reopened` / `ready_for_review` / `workflow_dispatch`) from synchronize follow-ups (`latest-commit`) so hot-push loops do not cancel the opening review or burn tokens on cancelled follow-ups. Optional merge gates should stay green only after first-pass landed. Concurrency and merge gating belong in the org reusable caller; this action still runs a single review.
 
+## [1.0.3] - 2026-08-22
+
+### Fixed
+
+- Copy the Grok prompt into the isolated review workspace (`$review_cwd/.grok-pr-review/prompt.md`) before invoking `--sandbox strict`. Bubblewrap only allows reading inside `--cwd`, so `$WORK/prompt.md` was denied on GitHub-hosted ubuntu-24.04 (`Permission denied (os error 13)`) after AppArmor userns setup succeeded. The action still uses `--sandbox strict`; it does not bind-mount the work tree or disable the sandbox.
+
+## [1.0.2] - 2026-08-22
+
+### Fixed
+
+- Enable bubblewrap user namespaces on Ubuntu 24.04+ GitHub-hosted runners after `bwrap` is present. Ubuntu's `kernel.apparmor_restrict_unprivileged_userns=1` blocks unprivileged uid maps (`bwrap: setting up uid map: Permission denied`). The action loads `bwrap-userns-restrict` when available, otherwise relaxes the restriction for the job, then probes `bwrap --unshare-user`. There is still no production switch to disable `--sandbox strict`.
+
+## [1.0.1] - 2026-08-22
+
 ### Fixed
 
 - Install `bubblewrap` (`bwrap`) on Linux before invoking the Grok CLI so GitHub-hosted Ubuntu runners can enforce the strict sandbox deny list. If `bwrap` is already present the install is skipped; if it cannot be installed the action still fails closed. Self-hosted Linux runners must provide `bwrap` or allow `sudo apt-get install -y bubblewrap`. There is no production switch to disable the sandbox.
-- Enable bubblewrap user namespaces on Ubuntu 24.04+ GitHub-hosted runners after `bwrap` is present. Ubuntu's `kernel.apparmor_restrict_unprivileged_userns=1` blocks unprivileged uid maps (`bwrap: setting up uid map: Permission denied`). The action loads `bwrap-userns-restrict` when available, otherwise relaxes the restriction for the job, then probes `bwrap --unshare-user`. There is still no production switch to disable `--sandbox strict`. Prep for v1.0.2.
-- Copy the Grok prompt into the isolated review workspace (`$review_cwd/.grok-pr-review/prompt.md`) before invoking `--sandbox strict`. Bubblewrap only allows reading inside `--cwd`, so `$WORK/prompt.md` was denied on GitHub-hosted ubuntu-24.04 (`Permission denied (os error 13)`) after AppArmor userns setup succeeded. The action still uses `--sandbox strict`; it does not bind-mount the work tree or disable the sandbox. Prep for v1.0.3.
 
 ## [1.0.0] - 2026-08-22
 
