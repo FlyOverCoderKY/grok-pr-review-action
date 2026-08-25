@@ -103,7 +103,8 @@ def test_readme_explains_latest_commit_and_auth() -> None:
 
 def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert text.index("## Unreleased") < text.index("## [1.0.4] - 2026-08-24")
+    assert text.index("## Unreleased") < text.index("## [1.0.5] - 2026-08-25")
+    assert text.index("## [1.0.5] - 2026-08-25") < text.index("## [1.0.4] - 2026-08-24")
     assert text.index("## [1.0.4] - 2026-08-24") < text.index("## [1.0.3] - 2026-08-22")
     assert text.index("## [1.0.3] - 2026-08-22") < text.index("## [1.0.2] - 2026-08-22")
     assert text.index("## [1.0.2] - 2026-08-22") < text.index("## [1.0.1] - 2026-08-22")
@@ -115,9 +116,13 @@ def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     assert "fixed_incorrectly" in text
     assert "verify_model" in text
     assert "review_mode" in text
-    unreleased, rest = text.split("## [1.0.4]", 1)
+    unreleased, rest = text.split("## [1.0.5]", 1)
     assert "###" not in unreleased.split("## Unreleased", 1)[1]
-    v104 = rest.split("## [1.0.3]", 1)[0]
+    v105 = rest.split("## [1.0.4]", 1)[0]
+    assert "coverage manifest count" in v105
+    assert "verdict=error" in v105
+    assert "end_turn" in v105
+    v104 = rest.split("## [1.0.4]", 1)[1].split("## [1.0.3]", 1)[0]
     assert "outside the embedded diff" in v104
     assert "recommended caller concurrency" in v104
     assert "org reusable caller" in v104

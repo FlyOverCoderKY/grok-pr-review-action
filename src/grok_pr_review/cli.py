@@ -51,9 +51,11 @@ from grok_pr_review.loop import (
 from grok_pr_review.prompt import build_prompt_from_collected
 from grok_pr_review.result import (
     ReviewResult,
+    coverage_count_mismatches,
     format_pipeline_failure_comment,
     mark_partial,
     neutralize_mentions,
+    note_coverage_count_mismatch,
     parse_grok_output,
     paths_outside_embed,
     should_fail_job,
@@ -403,6 +405,10 @@ def cmd_finish() -> int:
                 stop_reason=result.stop_reason,
             )
         else:
+            if state.mode == "initial":
+                result = note_coverage_count_mismatch(
+                    result, coverage_count_mismatches(result, diff_paths)
+                )
             if context.truncated:
                 omitted = paths_outside_embed(result, diff_paths)
                 if omitted:

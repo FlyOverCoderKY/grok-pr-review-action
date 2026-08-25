@@ -567,7 +567,9 @@ def validate_coverage(result: ReviewResult, diff_paths: set[str]) -> str | None:
 
     Coverage is required only for files that appear in the embedded diff.
     Findings on other paths are kept and do not fail this check. Per-file
-    counts must still match the findings kept for each embedded-diff file.
+    counts that do not match the findings kept for those files are not a
+    parse error; use coverage_count_mismatches() to surface a note while
+    keeping a completed verdict.
     """
     if not diff_paths:
         return None
@@ -582,17 +584,39 @@ def validate_coverage(result: ReviewResult, diff_paths: set[str]) -> str | None:
     if extra:
         named = ", ".join(extra[:5])
         return f"coverage lists file(s) not in the embedded diff: {named}"
+    return None
+
+
+def coverage_count_mismatches(result: ReviewResult, diff_paths: set[str]) -> list[str]:
+    """Per-file coverage counts that do not match reported in-diff findings.
+
+    These are not parse errors. Callers must keep the recovered findings and
+    post a completed verdict (issues / clean / partial), not verdict=error.
+    """
+    covered = dict(result.coverage)
     reported: dict[str, int] = {}
     for issue in result.issues:
         if issue.path and issue.path in diff_paths:
             reported[issue.path] = reported.get(issue.path, 0) + 1
+    notes: list[str] = []
     for path, count in covered.items():
-        if reported.get(path, 0) != count:
-            return (
-                f"coverage claims {count} finding(s) in {path!r} but "
-                f"{reported.get(path, 0)} were reported"
+        if path not in diff_paths:
+            continue
+        actual = reported.get(path, 0)
+        if actual != count:
+            notes.append(
+                f"coverage claims {count} finding(s) in {path!r} but {actual} were reported"
             )
-    return None
+    return notes
+
+
+def note_coverage_count_mismatch(result: ReviewResult, notes: list[str]) -> ReviewResult:
+    """Keep a completed review when coverage counts disagree with reported findings."""
+    if result.verdict == "error" or not notes:
+        return result
+    reason = "Coverage count mismatch; recovered findings were kept. " + "; ".join(notes)
+    combined = f"{result.partial_reason} {reason}" if result.partial_reason else reason
+    return replace(result, partial_reason=combined)
 
 
 def _parse_resolutions(findings: dict[str, Any]) -> list[Resolution]:

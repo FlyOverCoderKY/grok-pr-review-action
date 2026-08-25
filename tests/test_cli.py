@@ -768,36 +768,69 @@ def test_initial_finish_fails_closed_when_coverage_is_missing_or_wrong(
     assert github.result is not None
     assert github.result.verdict == "clean"
 
-    mismatch = {
-        "text": json.dumps(
-            {
-                "summary": "Claimed count does not match listed findings.",
-                "issues": [
-                    {
-                        "severity": "bug",
-                        "path": "src/app.py",
-                        "line": 3,
-                        "title": "Crash",
-                        "detail": "In the diff.",
-                    },
-                    {
-                        "severity": "nit",
-                        "path": "DOCS/README.md",
-                        "line": 1,
-                        "title": "Stale",
-                        "detail": "Docs were not edited.",
-                    },
-                ],
-                "coverage": [{"path": "src/app.py", "findings": 2}],
-            }
-        ),
-        "stopReason": "EndTurn",
-    }
-    (tmp_path / "grok-output.json").write_text(json.dumps(mismatch), encoding="utf-8")
-    assert cli.cmd_finish() == 1
-    broken = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
-    assert broken["verdict"] == "error"
-    assert "claims 2" in broken["incomplete_reason"]
+
+def test_initial_finish_keeps_findings_when_coverage_count_mismatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = "packages/engine/scripts/rules-dispatch.mjs"
+    diff = f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n+x\n"
+    (tmp_path / "diff.patch").write_text(diff, encoding="utf-8")
+    ReviewContext(
+        pr={"number": 7, "headRefOid": REVIEWED_SHA},
+        plan=DiffPlan("full-pr", "full-pr", None, REVIEWED_SHA, None),
+        truncated=False,
+        original_bytes=len(diff.encode("utf-8")),
+        embedded_bytes=len(diff.encode("utf-8")),
+        max_diff_kb=300,
+    ).write(tmp_path / "review-context.json")
+    output = _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    for claimed, reported in ((6, 7), (7, 8), (3, 2)):
+        envelope = {
+            "text": json.dumps(
+                {
+                    "summary": f"Coverage claimed {claimed} but {reported} findings were listed.",
+                    "issues": [
+                        {
+                            "severity": "risk",
+                            "path": path,
+                            "line": index + 1,
+                            "title": f"Finding {index + 1}",
+                            "detail": f"Recovered finding {index + 1} on {path}.",
+                        }
+                        for index in range(reported)
+                    ],
+                    "coverage": [{"path": path, "findings": claimed}],
+                }
+            ),
+            "stopReason": "end_turn",
+        }
+        (tmp_path / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
+        (tmp_path / "grok-exit").write_text("0", encoding="utf-8")
+        github.result = None
+        github.incomplete_result = None
+
+        assert cli.cmd_finish() == 0
+        written = output.read_text(encoding="utf-8")
+        assert "verdict=issues" in written
+        assert "verdict=error" not in written
+        assert github.incomplete_result is None
+        assert github.result is not None
+        assert github.result.verdict == "issues"
+        assert github.result.verdict != "error"
+        assert [issue.title for issue in github.result.issues] == [
+            f"Finding {index + 1}" for index in range(reported)
+        ]
+        assert github.result.partial_reason is not None
+        assert "recovered findings were kept" in github.result.partial_reason
+        assert f"claims {claimed}" in github.result.partial_reason
+        assert f"{reported} were reported" in github.result.partial_reason
+        posted = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+        assert posted["verdict"] == "issues"
+        assert posted["issue_count"] == reported
+        output.write_text("", encoding="utf-8")
 
 
 def test_initial_finish_keeps_findings_outside_the_pr(

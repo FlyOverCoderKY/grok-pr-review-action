@@ -4,6 +4,12 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## Unreleased
 
+## [1.0.5] - 2026-08-25
+
+### Fixed
+
+- An initial review whose coverage manifest count for an embedded-diff file does not match the number of reported findings no longer fail-closes as `verdict=error`. Recovered findings are kept and the review posts a completed `issues` / `clean` / `partial` verdict with a visible count-mismatch note. Missing coverage, a missing JSON blob, a non-`EndTurn` stop, or a schema violation still fail closed. This unblocks org first-pass (`grok-org-first-pass:done`) when Grok finishes with `end_turn` but the tally is off by one (RetireGolden#305 7-vs-8 / 6-vs-7).
+
 ## [1.0.4] - 2026-08-24
 
 ### Changed
