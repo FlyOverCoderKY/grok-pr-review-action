@@ -321,8 +321,61 @@ def test_coverage_allows_findings_outside_the_embedded_diff() -> None:
     ]
 
 
-def test_coverage_still_rejects_count_mismatches_with_extra_diff_findings() -> None:
-    from grok_pr_review.result import validate_coverage
+def test_coverage_count_mismatch_keeps_findings_and_is_not_error() -> None:
+    from grok_pr_review.result import (
+        coverage_count_mismatches,
+        note_coverage_count_mismatch,
+        validate_coverage,
+    )
+
+    path = "packages/engine/scripts/rules-dispatch.mjs"
+    for claimed, reported in ((6, 7), (7, 8), (3, 2)):
+        payload = {
+            "summary": f"Coverage claimed {claimed} but {reported} findings were listed.",
+            "issues": [
+                {
+                    "severity": "risk",
+                    "path": path,
+                    "line": index + 1,
+                    "title": f"Finding {index + 1}",
+                    "detail": f"Recovered finding {index + 1} on {path}.",
+                }
+                for index in range(reported)
+            ],
+            "coverage": [{"path": path, "findings": claimed}],
+        }
+        parsed = parse_grok_output(
+            json.dumps({"text": json.dumps(payload), "stopReason": "end_turn"})
+        )
+        assert parsed.verdict == "issues"
+        assert parsed.stop_reason == "end_turn"
+        assert len(parsed.issues) == reported
+        assert validate_coverage(parsed, {path}) is None
+
+        notes = coverage_count_mismatches(parsed, {path})
+        result = note_coverage_count_mismatch(parsed, notes)
+        assert notes == [
+            f"coverage claims {claimed} finding(s) in {path!r} but {reported} were reported"
+        ]
+        assert result.verdict == "issues"
+        assert result.verdict != "error"
+        assert result.incomplete is False
+        assert result.incomplete_reason is None
+        assert [issue.title for issue in result.issues] == [
+            f"Finding {index + 1}" for index in range(reported)
+        ]
+        assert result.partial_reason is not None
+        assert "recovered findings were kept" in result.partial_reason
+        assert f"claims {claimed}" in result.partial_reason
+        assert f"{reported} were reported" in result.partial_reason
+
+
+def test_coverage_count_mismatch_does_not_drop_out_of_diff_findings() -> None:
+    from grok_pr_review.result import (
+        coverage_count_mismatches,
+        note_coverage_count_mismatch,
+        validate_coverage,
+    )
 
     result = ReviewResult(
         verdict="issues",
@@ -332,11 +385,35 @@ def test_coverage_still_rejects_count_mismatches_with_extra_diff_findings() -> N
             Issue("nit", "DOCS/README.md", 1, "Stale README", "Docs were not edited."),
         ],
         coverage=[("src/app.py", 2)],
+        stop_reason="end_turn",
     )
-    error = validate_coverage(result, {"src/app.py"})
-    assert error is not None
-    assert "claims 2" in error
-    assert "1 were reported" in error
+    assert validate_coverage(result, {"src/app.py"}) is None
+    noted = note_coverage_count_mismatch(
+        result, coverage_count_mismatches(result, {"src/app.py"})
+    )
+    assert noted.verdict == "issues"
+    assert [issue.path for issue in noted.issues] == ["src/app.py", "DOCS/README.md"]
+    assert noted.partial_reason is not None
+    assert "claims 2" in noted.partial_reason
+    assert "1 were reported" in noted.partial_reason
+
+
+def test_coverage_count_mismatch_note_does_not_rewrite_an_error() -> None:
+    from grok_pr_review.result import note_coverage_count_mismatch
+
+    error = ReviewResult(
+        verdict="error",
+        summary="One real bug.",
+        issues=[Issue("bug", "src/app.py", 3, "Crash", "In the diff.")],
+        incomplete_reason="Grok returned no structured JSON findings.",
+        stop_reason="end_turn",
+    )
+    noted = note_coverage_count_mismatch(
+        error, ["coverage claims 6 finding(s) in 'src/app.py' but 7 were reported"]
+    )
+    assert noted is error
+    assert noted.verdict == "error"
+    assert noted.incomplete_reason == "Grok returned no structured JSON findings."
 
 
 def test_coverage_still_requires_every_embedded_diff_file() -> None:
