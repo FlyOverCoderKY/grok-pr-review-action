@@ -388,9 +388,7 @@ def test_coverage_count_mismatch_does_not_drop_out_of_diff_findings() -> None:
         stop_reason="end_turn",
     )
     assert validate_coverage(result, {"src/app.py"}) is None
-    noted = note_coverage_count_mismatch(
-        result, coverage_count_mismatches(result, {"src/app.py"})
-    )
+    noted = note_coverage_count_mismatch(result, coverage_count_mismatches(result, {"src/app.py"}))
     assert noted.verdict == "issues"
     assert [issue.path for issue in noted.issues] == ["src/app.py", "DOCS/README.md"]
     assert noted.partial_reason is not None
