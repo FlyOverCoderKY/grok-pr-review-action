@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Literal, Protocol
 
 ScopeName = Literal["full-pr", "latest-commit"]
@@ -72,6 +73,8 @@ class Truncation:
     original_bytes: int
     embedded_bytes: int
     max_diff_kb: int
+    stubbed_paths: tuple[str, ...] = ()
+    hard_cut: bool = False
 
     @property
     def notice(self) -> str | None:
@@ -79,10 +82,23 @@ class Truncation:
             return None
         original_kb = self.original_bytes / 1024
         embedded_kb = self.embedded_bytes / 1024
-        return (
+        sentences = [
             f"Diff truncated from {original_kb:.1f} KB to {embedded_kb:.1f} KB "
-            f"(max_diff_kb={self.max_diff_kb}). Later files/hunks are missing."
-        )
+            f"(max_diff_kb={self.max_diff_kb})."
+        ]
+        if self.stubbed_paths:
+            named = ", ".join(self.stubbed_paths[:5])
+            if len(self.stubbed_paths) > 5:
+                named += f", and {len(self.stubbed_paths) - 5} more"
+            sentences.append(
+                f"{len(self.stubbed_paths)} generated or large data file(s) are "
+                f"embedded as header-only stubs: {named}."
+            )
+        if self.stubbed_paths and not self.hard_cut:
+            sentences.append("Every file is present; only stubbed hunks are omitted.")
+        else:
+            sentences.append("Later files/hunks are missing.")
+        return " ".join(sentences)
 
 
 @dataclass(frozen=True)
@@ -152,6 +168,39 @@ def plan_diff(request: DiffRequest) -> DiffPlan:
     )
 
 
+# Diff triage for over-cap diffs: hunks of these files are replaced with
+# header-only stubs before falling back to a positional cut, so hand-written
+# source stays embedded. Never applied to a diff that already fits.
+GENERATED_BASENAMES = frozenset(
+    {
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "packages.lock.json",
+        "yarn.lock",
+        "pnpm-lock.yaml",
+        "bun.lock",
+        "bun.lockb",
+        "deno.lock",
+        "cargo.lock",
+        "poetry.lock",
+        "uv.lock",
+        "pipfile.lock",
+        "pdm.lock",
+        "composer.lock",
+        "gemfile.lock",
+        "go.sum",
+        "gradle.lockfile",
+        "flake.lock",
+    }
+)
+GENERATED_SUFFIXES = (".min.js", ".min.css", ".map", ".snap", ".pb.go", "_pb2.py", "_pb2.pyi")
+GENERATED_DIR_NAMES = frozenset({"node_modules", "vendor", "__generated__", ".yarn"})
+# Data-ish files are stubbed only when their own diff is large; a small
+# hand-maintained JSON or type stub is embedded like any other source.
+LARGE_DATA_SUFFIXES = (".json", ".jsonl", ".ndjson", ".csv", ".tsv", ".svg", ".d.ts")
+LARGE_DATA_STUB_BYTES = 65_536
+
+
 def truncate_diff(diff: str, max_diff_kb: int) -> Truncation:
     if max_diff_kb <= 0:
         raise ValueError("max_diff_kb must be a positive integer")
@@ -165,7 +214,18 @@ def truncate_diff(diff: str, max_diff_kb: int) -> Truncation:
             embedded_bytes=len(data),
             max_diff_kb=max_diff_kb,
         )
-    cut = _cut_diff_at_boundary(data, limit)
+    working, stubbed_paths = _stub_generated_hunks(diff)
+    working_data = working.encode("utf-8")
+    if len(working_data) <= limit:
+        return Truncation(
+            text=working,
+            truncated=True,
+            original_bytes=len(data),
+            embedded_bytes=len(working_data),
+            max_diff_kb=max_diff_kb,
+            stubbed_paths=stubbed_paths,
+        )
+    cut = _cut_diff_at_boundary(working_data, limit)
     text = cut.decode("utf-8", errors="ignore")
     return Truncation(
         text=text,
@@ -173,7 +233,78 @@ def truncate_diff(diff: str, max_diff_kb: int) -> Truncation:
         original_bytes=len(data),
         embedded_bytes=len(text.encode("utf-8")),
         max_diff_kb=max_diff_kb,
+        stubbed_paths=stubbed_paths,
+        hard_cut=True,
     )
+
+
+def _stub_generated_hunks(diff: str) -> tuple[str, tuple[str, ...]]:
+    """Replace each generated/large-data file section with a header-only stub.
+
+    The `diff --git` header line survives, so the file stays in the embedded
+    diff's path set (and therefore in the coverage contract); only its hunks
+    are dropped, with a visible note telling the model what was omitted.
+    """
+    pieces: list[str] = []
+    stubbed: list[str] = []
+    for header, body in _file_sections(diff):
+        if header is None:
+            pieces.append(body)
+            continue
+        path = _header_path(header)
+        section = header + body
+        if path is None or not _should_stub(path, len(section.encode("utf-8"))):
+            pieces.append(section)
+            continue
+        hunks = sum(1 for line in body.splitlines() if line.startswith("@@"))
+        omitted = len(body.encode("utf-8"))
+        stubbed.append(path)
+        pieces.append(
+            header + f"# {hunks} hunk(s), {omitted} bytes omitted (generated or large data "
+            "file); this file is still part of the diff - account for it in "
+            "coverage and inspect it with tools if it needs review\n"
+        )
+    return "".join(pieces), tuple(stubbed)
+
+
+def _file_sections(diff: str) -> list[tuple[str | None, str]]:
+    """Split a unified diff into (header line, section body) pairs.
+
+    Text before the first `diff --git` header is returned as (None, text).
+    """
+    sections: list[tuple[str | None, str]] = []
+    header: str | None = None
+    body: list[str] = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if header is not None or body:
+                sections.append((header, "".join(body)))
+            header = line
+            body = []
+        else:
+            body.append(line)
+    if header is not None or body:
+        sections.append((header, "".join(body)))
+    return sections
+
+
+def _header_path(header: str) -> str | None:
+    remainder = header[len("diff --git a/") :] if header.startswith("diff --git a/") else ""
+    _left, separator, right = remainder.rstrip("\n").rpartition(" b/")
+    return right if separator and right else None
+
+
+def _should_stub(path: str, section_bytes: int) -> bool:
+    lowered = path.lower()
+    parts = PurePosixPath(lowered).parts
+    basename = parts[-1] if parts else lowered
+    if basename in GENERATED_BASENAMES:
+        return True
+    if basename.endswith(GENERATED_SUFFIXES):
+        return True
+    if any(part in GENERATED_DIR_NAMES for part in parts[:-1]):
+        return True
+    return basename.endswith(LARGE_DATA_SUFFIXES) and section_bytes > LARGE_DATA_STUB_BYTES
 
 
 def _cut_diff_at_boundary(data: bytes, limit: int) -> bytes:

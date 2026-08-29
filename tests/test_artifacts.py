@@ -30,6 +30,34 @@ def test_review_context_round_trips_with_a_versioned_schema(tmp_path: Path) -> N
     assert restored.to_dict()["schema_version"] == 1
 
 
+def test_review_context_round_trips_stubbed_truncation(tmp_path: Path) -> None:
+    diff = "diff --git a/src/app.py b/src/app.py\n+x\n"
+    size = len(diff.encode("utf-8"))
+    collected = CollectedReview(
+        pr={"number": 7, "headRefOid": HEAD, "title": "Change"},
+        plan=DiffPlan("full-pr", "full-pr", None, HEAD, None),
+        truncation=Truncation(
+            text=diff,
+            truncated=True,
+            original_bytes=size + 90_000,
+            embedded_bytes=size,
+            max_diff_kb=300,
+            stubbed_paths=("package-lock.json", "src/data/rule-coverage.json"),
+        ),
+    )
+    path = tmp_path / "review-context.json"
+
+    ReviewContext.from_collected(collected).write(path)
+    restored = ReviewContext.read(path)
+
+    assert restored.to_collected(diff) == collected
+    assert restored.stubbed_paths == ("package-lock.json", "src/data/rule-coverage.json")
+    assert restored.hard_cut is False
+    notice = restored.truncation_notice or ""
+    assert "package-lock.json" in notice
+    assert "Every file is present" in notice
+
+
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
@@ -38,6 +66,13 @@ def test_review_context_round_trips_with_a_versioned_schema(tmp_path: Path) -> N
         (lambda data: data["pr"].update(headRefOid="short"), "full commit SHA"),
         (lambda data: data["plan"].update(to_sha="b" * 40), "must match"),
         (lambda data: data["truncation"].update(embedded_bytes=1), "preserve every byte"),
+        (
+            lambda data: data["truncation"].update(stubbed_paths=["package-lock.json"]),
+            "must be marked truncated",
+        ),
+        (lambda data: data["truncation"].update(hard_cut=True), "must be marked truncated"),
+        (lambda data: data["truncation"].update(stubbed_paths=[""]), "non-empty strings"),
+        (lambda data: data["truncation"].update(stubbed_paths="oops"), "must be an array"),
     ],
 )
 def test_review_context_rejects_malformed_or_inconsistent_data(
