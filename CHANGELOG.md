@@ -4,6 +4,8 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## Unreleased
 
+## [1.0.6] - 2026-08-28
+
 ### Fixed
 
 - Dense PRs whose diff exceeds `max_diff_kb` no longer fail-close as `verdict=error` when Grok's coverage manifest does not line up with the truncated embed. Coverage entries for files outside the embedded diff — files Grok reviewed with its read-only tools — are now ignored instead of rejected as invalid structured output, and when the embed was truncated, coverage that misses embedded-diff files degrades the completed review to `verdict=partial` with a visible note instead of discarding it. An untruncated initial review still fails closed when coverage does not account for every embedded-diff file. The initial-round prompt now also tells Grok to list only embedded-diff files in `coverage`. This lets a required first-pass gate go green with an honest partial review on dense PRs (RetireGolden retiregolden.org#108: a 1178 KB diff truncated to 300 KB permanently redded the gate).
