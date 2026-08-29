@@ -103,7 +103,8 @@ def test_readme_explains_latest_commit_and_auth() -> None:
 
 def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     text = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
-    assert text.index("## Unreleased") < text.index("## [1.0.6] - 2026-08-28")
+    assert text.index("## Unreleased") < text.index("## [1.0.7] - 2026-08-29")
+    assert text.index("## [1.0.7] - 2026-08-29") < text.index("## [1.0.6] - 2026-08-28")
     assert text.index("## [1.0.6] - 2026-08-28") < text.index("## [1.0.5] - 2026-08-25")
     assert text.index("## [1.0.5] - 2026-08-25") < text.index("## [1.0.4] - 2026-08-24")
     assert text.index("## [1.0.4] - 2026-08-24") < text.index("## [1.0.3] - 2026-08-22")
@@ -117,11 +118,14 @@ def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     assert "fixed_incorrectly" in text
     assert "verify_model" in text
     assert "review_mode" in text
-    unreleased, rest = text.split("## [1.0.6]", 1)
-    unreleased_section = unreleased.split("## Unreleased", 1)[1]
-    assert "Generated-file triage" in unreleased_section
-    assert "header-only stubs" in unreleased_section
-    assert "coverage contract" in unreleased_section
+    unreleased, rest = text.split("## [1.0.7]", 1)
+    assert "###" not in unreleased.split("## Unreleased", 1)[1]
+    v107 = rest.split("## [1.0.6]", 1)[0]
+    assert "Generated-file triage" in v107
+    assert "header-only stubs" in v107
+    assert "coverage contract" in v107
+    rest = rest.split("## [1.0.6]", 1)[1]
+    rest = "## [1.0.6]" + rest
     v106 = rest.split("## [1.0.5]", 1)[0]
     assert "truncated embed" in v106
     assert "verdict=partial" in v106
