@@ -59,6 +59,7 @@ class ActionConfig:
     verify_effort: Effort
     verify_escalation_lines: int
     bot_login: str
+    force_review: bool
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]) -> ActionConfig:
@@ -113,6 +114,7 @@ class ActionConfig:
                 maximum=MAX_VERIFY_ESCALATION_LINES,
             ),
             bot_login=parse_bot_login(env.get("BOT_LOGIN", DEFAULT_BOT_LOGIN)),
+            force_review=parse_bool(env.get("FORCE_REVIEW", "false"), "force_review"),
         )
 
 

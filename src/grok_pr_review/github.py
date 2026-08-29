@@ -17,7 +17,7 @@ from grok_pr_review.result import (
     inline_review_comments,
     limit_github_body,
 )
-from grok_pr_review.scope import GhError
+from grok_pr_review.scope import GhError, HistoryDiverged
 
 STATUS_MARKER = "<!-- grok-pr-review-action-status -->"
 
@@ -57,7 +57,7 @@ class GitHubCli:
         status = comparison.get("status")
         behind_by = comparison.get("behind_by")
         if status != "ahead" or behind_by not in {0, None}:
-            raise GhError("commit comparison is not a linear fast-forward range")
+            raise HistoryDiverged("commit comparison is not a linear fast-forward range")
         return self._api(
             [
                 "-H",

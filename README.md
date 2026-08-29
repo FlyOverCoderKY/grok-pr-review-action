@@ -16,7 +16,7 @@ It is an independent implementation. It does **not** require SuperGrok, `grok lo
 | Follow-up | `synchronize` | `latest-commit` | `low` |
 
 - `full-pr` (default) embeds `gh pr diff` for the whole pull request, capped by `max_diff_kb` (default 300). A truncated review receives a visible `partial` verdict and never appears clean.
-- `latest-commit` embeds **only the new work on this push**. It prefers a linear `github.event.before...github.event.after` range. If `before` is missing, the comparison fails, or the history diverged after a force-push, it falls back to the **single latest commit on the reviewed PR head** and says so in the prompt. It never silently falls back to the full PR diff.
+- `latest-commit` embeds **only the new work on this push** when the ledger boundary is still an ancestor of the PR head. It prefers a linear range from the last ledgered SHA to the current head. A missing boundary degrades visibly to the single latest commit. If history has diverged after a force-push, the action does not run a narrow late-round verification: it visibly resets to a freshly pinned **full-PR round 1** at the `nit` floor.
 
 ## Auth
 
@@ -64,6 +64,10 @@ on:
   pull_request:
     types: [opened, reopened, ready_for_review, synchronize]
 
+concurrency:
+  group: grok-review-${{ github.repository }}-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
 jobs:
   grok:
     runs-on: ubuntu-latest
@@ -104,75 +108,78 @@ jobs:
 
 `@v1` is the intended consumer pin. Until the movable `v1` alias exists, pin the immutable `v1.0.0` tag (`FlyOverCoderKY/grok-pr-review-action@v1.0.0`) or a commit SHA. [RELEASING.md](RELEASING.md) tags immutable `v1.0.0` first, smoke-tests that tag, then moves `v1`.
 
-The example above is a single job with two steps. Org reusable callers with agent hot-push loops should use the [Recommended caller concurrency](#recommended-caller-concurrency) recipe so a `synchronize` run cannot cancel the opening `full-pr` review.
+The example above is a single job with two steps. Production and org reusable callers must use the [Required caller serialization](#required-caller-serialization) contract so overlapping triggers cannot create duplicate waves.
 
-## Recommended caller concurrency
+## Required caller serialization
 
-This action runs **one review per invocation**. It does not implement workflow concurrency or merge gating. Those belong in the org reusable caller (for example RetireGolden/.github, and later pegma-dev/.github) that wraps this action.
+This action runs **one review per invocation**. Every caller for the same repository and PR — `opened`, `reopened`, `ready_for_review`, `synchronize`, `workflow_dispatch`, and comment-command dispatches — must share one caller-level concurrency group with `cancel-in-progress: false`. This is a required integration contract, not an optional optimization. Put it in the org reusable caller (for example RetireGolden/.github, and later pegma-dev/.github) so separate entry-point workflows cannot accidentally choose different locks.
 
-A single PR-wide `concurrency` group with `cancel-in-progress: true` treats `opened` and `synchronize` as the same run. The first agent push then cancels the in-progress first pass — you lose the opening review and still pay for the cancelled tokens. A follow-up that starts before that first pass has posted also fails closed: `latest-commit` verify needs the prior ledger.
+The action's same-SHA checks are defense-in-depth. It checks before Grok setup and refetches immediately before posting, which eliminates the common overlap where one run publishes while another is evaluating. GitHub review creation has no compare-and-swap condition, however, so two unsynchronized jobs can both pass the final check and then both post. The action does not claim that check-then-post is atomic; caller serialization supplies the mutual exclusion.
 
-### Recipe
+Only completed, non-partial reviews publish authoritative exact-SHA ledger markers. Incomplete and partial runs deliberately remain retryable and therefore are not terminally deduplicated; without the required concurrency contract, simultaneous failed/partial attempts can still post more than one warning. Adding a terminal marker to those results would suppress the retry needed to obtain complete coverage, so the action leaves that residual explicit rather than pretending it is safe to erase.
 
-Use **separate first-pass and follow-up jobs**, or distinct **job-level / two-suffix concurrency groups**, so the two passes cannot cancel each other.
+### Reusable workflow contract
 
-| Pass | Events | `review_scope` | Cancel-in-progress |
-| --- | --- | --- | --- |
-| First-pass | `opened`, `reopened`, `ready_for_review`, `workflow_dispatch` | `full-pr` | Never from `synchronize`. Rapid first-passes may cancel each other. |
-| Follow-up | `synchronize` | `latest-commit` | OK among follow-ups only. Start only after first-pass has completed. |
-
-Do **not** put first-pass and follow-up in one concurrency group that `synchronize` can cancel.
-
-A two-suffix workflow-level group is enough when the reusable workflow only runs this review:
+Use the same group string across every workflow that can invoke a review for the PR. Do not add event, mode, first-pass, or follow-up suffixes:
 
 ```yaml
-# Same PR, two groups: synchronize must not cancel an in-progress first-pass.
+name: Reusable Grok review
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: number
+      event_action:
+        required: true
+        type: string
+    secrets:
+      XAI_API_KEY:
+        required: true
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        required: true
+        type: number
+      event_action:
+        required: false
+        default: opened
+        type: choice
+        options: [opened, synchronize]
+
+# Required: one unsuffixed lock for every way this repo can review this PR.
 concurrency:
-  group: grok-review-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}-${{ github.event.action == 'synchronize' && 'follow-up' || 'first-pass' }}
-  cancel-in-progress: true
-```
+  group: grok-review-${{ github.repository }}-pr-${{ inputs.pr_number }}
+  cancel-in-progress: false
 
-Job-level groups are better when the workflow has other jobs you do not want cancelled with a superseded follow-up:
-
-```yaml
 jobs:
-  grok-first-pass:
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
-      github.event.action == 'reopened' ||
-      github.event.action == 'ready_for_review'
-    concurrency:
-      group: grok-first-pass-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
-      cancel-in-progress: true
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
-      # checkout, then:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
       - uses: FlyOverCoderKY/grok-pr-review-action@v1
         with:
-          review_scope: full-pr
-          # ...
-
-  grok-follow-up:
-    if: github.event.action == 'synchronize'
-    concurrency:
-      group: grok-follow-up-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
-      cancel-in-progress: true
-    steps:
-      # Wait until grok-first-pass (or its check) succeeded for this PR.
-      # Do not use needs: grok-first-pass — that job is skipped on synchronize.
-      - uses: FlyOverCoderKY/grok-pr-review-action@v1
-        with:
-          review_scope: latest-commit
-          # ...
+          pr_number: ${{ inputs.pr_number }}
+          review_scope: ${{ inputs.event_action == 'synchronize' && 'latest-commit' || 'full-pr' }}
+          review_mode: auto
+        env:
+          XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
 ```
 
-### Follow-up waits for first-pass
+An explicit same-code re-review command uses this same group and passes `force_review: true`; the override changes deduplication policy, not serialization. A `synchronize` invocation queued behind the opening review sees its published ledger when it starts. If no ledger exists, `latest-commit` verification still fails closed rather than silently seeding state from one commit.
 
-A `synchronize` job should not invoke this action until the first-pass job (or its check) has a successful conclusion for the PR. `latest-commit` verify without a published ledger fails closed instead of silently resetting to round 1.
+GitHub concurrency permits at most one running and one pending job per group and does not guarantee execution order. The action's ledger continuity and same-SHA guards remain necessary after serialization, but neither replaces it.
 
 ### Optional merge gate
 
-If branch protection needs a required check, publish a dedicated first-pass status (for example `grok-first-pass`) and require that. Keep it green only after first-pass has landed. Do not require the follow-up job: cancelled `synchronize` runs would fail the gate even when the opening review succeeded.
+If branch protection needs a required check, publish a dedicated first-pass status (for example `grok-first-pass`) and require that. Keep it green only after the first pass has landed. Follow-up policy can remain separate from the first-pass gate.
 
 ## Inputs
 
@@ -197,6 +204,7 @@ If branch protection needs a required check, publish a dedicated first-pass stat
 | `verify_effort` | _empty_ | Optional effort override for verify rounds (defaults to `effort`). |
 | `verify_escalation_lines` | `500` | A verify push changing more lines than this (or one whose diff was truncated) gets a full-severity review with the primary model. |
 | `bot_login` | `github-actions[bot]` | Login whose reviews are trusted as loop-ledger authors. Must match the identity `github_token` posts as, or the loop loses continuity. See below. |
+| `force_review` | `false` | Explicitly bypass both same-SHA duplicate guards for an intentional manual re-review. Leave false for event-driven and ordinary `workflow_dispatch` runs. |
 
 ### `bot_login` and ledger continuity
 
@@ -224,9 +232,9 @@ The action is built for an agentic PR loop: review → agent fixes → re-review
 
 **Round 1 (initial, on `opened`)** is deliberately exhaustive and recall-biased. The prompt tells Grok its findings are adjudicated by an automated fixing agent, not read by a human, so it should report every issue it can name a failure scenario for — bugs, risks, and nits — sweep the diff repeatedly until a sweep finds nothing new, and account for every file in a coverage manifest. The manifest is enforced, not advisory: an untruncated initial review whose coverage does not account for every **embedded-diff** file — including renames, mode-only changes, and binary files — is rejected as invalid output and fails the job. Coverage entries for files outside the embedded diff (files Grok examined with its read-only tools) are ignored, never an error. When the diff exceeded `max_diff_kb` and was truncated, coverage that cannot account for every embedded file degrades the completed review to `partial` with a visible note instead of failing it — a dense PR gets an honest partial review and a usable verdict, never a discarded review behind a permanently red required check. Before any positional cut, an over-cap diff goes through generated-file triage: lock files, vendored and `__generated__` paths, minified assets, source maps, and data files (`.json`, `.csv`, `.svg`, `.d.ts`, …) whose own diff exceeds 64 KB are embedded as header-only stubs, so hand-written source stays fully embedded. A stubbed file keeps its `diff --git` header and stays in the coverage contract — its stub carries a note saying how many hunks and bytes were omitted, and Grok can still open the file with tools. A diff that fits the cap is never stubbed, and a stub-triaged review is still `partial` with the stubbed files named in the warning. A per-file coverage count that does not match the findings kept for that file is not a parse error: recovered findings are posted with a completed `issues` / `clean` / `partial` verdict and a visible mismatch note, so a completed `end_turn` first-pass is not discarded. Findings may also cite files outside the embedded diff — a PR file omitted by `max_diff_kb` truncation, or a blast-radius / stale-doc file the change did not edit. Those citations are posted with the rest of the review; they are not a parse error and do not set `verdict=error`. A truncated embed is still `partial`. Expect the finding count to be front-loaded: a thorough round 1 is cheaper than five shallow rounds.
 
-**Rounds 2+ (verify, on `synchronize`)** are convergence rounds. Under `latest-commit` scope the verification diff spans everything **since the last published review** (from the SHA recorded in the ledger to the current head), not just this push's webhook range — so concurrent pushes completing out of order can never leave a commit range unreviewed. The bot reads its own prior review, re-lists the open findings, and asks Grok to verdict each one — `fixed`, `not_fixed`, `fixed_incorrectly`, or `disputed` — using the fix commits and the fixing agent's comment-thread replies as evidence. A reasoned rebuttal settles a finding as disputed; it is never re-raised without new evidence. New findings are accepted only in code the fix commits touched, at or above the round's severity floor from `severity_schedule` — so by round 3 (default) a nit about comment phrasing is structurally unreportable. A verify push changing more than `verify_escalation_lines` lines — or one whose diff exceeded `max_diff_kb` and was truncated — escalates to a full-severity review automatically, because a massive mid-loop change means the loop is off the rails. When the floor rises, still-open lower-severity findings from earlier rounds are retired without a disposition — by design: by round 3 an unfixed nit is noise, not signal — so "open findings" means unresolved findings at or above the current floor.
+**Rounds 2+ (verify, on `synchronize`)** are convergence rounds. Under `latest-commit` scope the verification diff spans everything **since the last published review** (from the SHA recorded in the ledger to the current head), not just this push's webhook range — so concurrent pushes completing out of order can never leave a commit range unreviewed. If that ledger SHA is no longer an ancestor because history was rewritten, the action discards the late-round floor and carried state for this run, recollects the complete PR, and starts a new round 1. The bot otherwise reads its own prior review, re-lists the open findings, and asks Grok to verdict each one — `fixed`, `not_fixed`, `fixed_incorrectly`, or `disputed` — using the fix commits and the fixing agent's comment-thread replies as evidence. A reasoned rebuttal settles a finding as disputed; it is never re-raised without new evidence. New findings are accepted only in code the fix commits touched, at or above the round's severity floor from `severity_schedule` — so by round 3 (default) a nit about comment phrasing is structurally unreportable. A verify push changing more than `verify_escalation_lines` lines — or one whose diff exceeded `max_diff_kb` and was truncated — escalates to a full-severity review automatically, because a massive mid-loop change means the loop is off the rails. When the floor rises, still-open lower-severity findings from earlier rounds are retired without a disposition — by design: by round 3 an unfixed nit is noise, not signal — so "open findings" means unresolved findings at or above the current floor.
 
-State lives in a hidden, base64-encoded ledger inside the bot's own review bodies — the fixing agent needs no bot-specific protocol, so this action coexists with other review bots. The ledger is **only trusted from reviews authored by `bot_login`** (default `github-actions[bot]`) and is bound to the repository, PR, and reviewed commit, so other reviewers cannot forge loop state. If `github_token` posts as a different login and `bot_login` is left at the default, prior rounds are invisible: continuity is lost and disposition tracking breaks (see [`bot_login` and ledger continuity](#bot_login-and-ledger-continuity)). State recovery fails closed: if prior reviews cannot be read, if the newest ledger marker is corrupted, or if a `latest-commit` synchronize run finds no prior state at all, the run fails visibly instead of silently resetting to round 1 and discarding carried findings — only an explicit `review_mode: initial` with `review_scope: full-pr` (or a state-free `full-pr` collection) starts fresh. The ledger preserves every open finding or fails the run: settled disputed findings may be trimmed to fit the marker's size limits, but unresolved findings are never silently dropped. Any partial run — including a stale, truncated, or history-fallback review — posts its findings and warning but never publishes ledger state; the previous complete marker remains the retry boundary. Dispositions come only from commits and ordinary GitHub comment replies. Coverage is validated against the embedded diff's paths; findings may cite files outside that embed and are still posted. A per-file coverage count mismatch is noted on the completed review and does not fail-close an `EndTurn` result. `issue_count`/`bug_count` outputs report **open** findings including unfixed carry-overs, so an agent loop should iterate until `bug_count` is `0` (or `issue_count`, if it chases risks too). Use `verify_model`/`verify_effort` to run verify rounds on a cheaper tier when you want that trade — verifying a fix is a much easier task than finding the issue was. Setting `verify_model` different from `model` is supported, but it is an intentional xAI prompt-cache miss on verify rounds (different model = no shared cache with the initial pass). Keep both on the same model (for example `grok-4.6`) unless you consciously want a cheaper verify tier over cache reuse. The posted review is labeled with the model that actually ran. Forcing `review_mode: initial` with `review_scope: full-pr` (or any `workflow_dispatch` run using that scope) resets the loop with a fresh exhaustive review. Caller concurrency belongs in the reusable workflow, not this action: isolate first-pass from `synchronize` so hot-push loops do not cancel the opening review. See [Recommended caller concurrency](#recommended-caller-concurrency).
+State lives in a hidden, base64-encoded ledger inside the bot's own review bodies — the fixing agent needs no bot-specific protocol, so this action coexists with other review bots. The ledger is **only trusted from reviews authored by `bot_login`** (default `github-actions[bot]`) and is bound to the repository, PR, and reviewed commit, so other reviewers cannot forge loop state. The same commit binding powers the preflight and pre-post duplicate guards. If `github_token` posts as a different login and `bot_login` is left at the default, prior rounds are invisible: continuity is lost and disposition tracking breaks (see [`bot_login` and ledger continuity](#bot_login-and-ledger-continuity)). State recovery fails closed: if prior reviews cannot be read, if the newest ledger marker is corrupted, or if a `latest-commit` synchronize run finds no prior state at all, the run fails visibly instead of silently resetting to round 1 and discarding carried findings. A confirmed history divergence is the exception: it visibly recollects the full PR and resets to round 1 because the old ledger boundary cannot safely define a verification range. Authentication, rate-limit, timeout, and other operational comparison failures do not trigger that reset; they fail before model execution and leave the prior ledger authoritative. The ledger preserves every open finding or fails the run: settled disputed findings may be trimmed to fit the marker's size limits, but unresolved findings are never silently dropped. Any partial run — including a stale or truncated review — posts its findings and warning but never publishes ledger state; the previous complete marker remains the retry boundary. Dispositions come only from commits and ordinary GitHub comment replies. Coverage is validated against the embedded diff's paths; findings may cite files outside that embed and are still posted. A per-file coverage count mismatch is noted on the completed review and does not fail-close an `EndTurn` result. `issue_count`/`bug_count` outputs report **open** findings including unfixed carry-overs, so an agent loop should iterate until `bug_count` is `0` (or `issue_count`, if it chases risks too). Use `verify_model`/`verify_effort` to run verify rounds on a cheaper tier when you want that trade — verifying a fix is a much easier task than finding the issue was. Setting `verify_model` different from `model` is supported, but it is an intentional xAI prompt-cache miss on verify rounds (different model = no shared cache with the initial pass). Keep both on the same model (for example `grok-4.6`) unless you consciously want a cheaper verify tier over cache reuse. The posted review is labeled with the model that actually ran. Forcing `review_mode: initial` with `review_scope: full-pr` resets the loop with a fresh exhaustive review; when the SHA was already reviewed, that intentional reset must also set `force_review: true` to bypass duplicate suppression. Caller serialization belongs in the reusable workflow, not this action. See [Required caller serialization](#required-caller-serialization).
 
 Grok runs headless with `--prompt-file` and JSON output. Tools are allowlisted to `read_file`, `grep`, and `list_dir`. There is no shell tool. `--yolo` only auto-approves those read-only tools.
 

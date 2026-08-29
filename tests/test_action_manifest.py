@@ -30,8 +30,12 @@ def test_action_yml_uses_xai_api_key_not_supergrok() -> None:
     assert "verify_model" in text
     assert "verify_escalation_lines" in text
     assert "bot_login" in text
+    assert "force_review" in text
+    assert "grok_pr_review preflight" in text
+    assert text.index("Check for an existing same-commit verdict") < text.index("Install Grok CLI")
+    assert "steps.preflight.outputs.skip != 'true'" in text
     assert "model-override" in text
-    assert "steps.finish.outputs.round" in text
+    assert "steps.finish.outputs.round || steps.preflight.outputs.round" in text
     assert "prepare-workspace" in text
     assert "scripts/install-grok.sh" in text
     assert "scripts/run-grok.sh" in text
@@ -91,11 +95,14 @@ def test_readme_explains_latest_commit_and_auth() -> None:
     assert "bwrap-userns-restrict" in text
     assert "Ubuntu 24.04" in text
     assert "does **not** disable `--sandbox strict`" in text
-    assert "## Recommended caller concurrency" in text
+    assert "## Required caller serialization" in text
     assert "one review per invocation" in text
-    assert "Never from `synchronize`" in text
-    assert "Start only after first-pass has completed" in text
-    assert "Do not require the follow-up job" in text
+    assert "cancel-in-progress: false" in text
+    assert "one unsuffixed lock" in text
+    assert "has no compare-and-swap condition" in text
+    assert "does not claim that check-then-post is atomic" in text
+    assert "Incomplete and partial runs deliberately remain retryable" in text
+    assert "GitHub concurrency permits at most one running and one pending job" in text
     assert "org reusable caller" in text
     stale = "cancel-in-progress: true` to avoid paying for superseded runs."
     assert stale not in text
@@ -119,7 +126,11 @@ def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     assert "verify_model" in text
     assert "review_mode" in text
     unreleased, rest = text.split("## [1.0.7]", 1)
-    assert "###" not in unreleased.split("## Unreleased", 1)[1]
+    unreleased_body = unreleased.split("## Unreleased", 1)[1]
+    assert "### Added" in unreleased_body
+    assert "Two-phase duplicate suppression" in unreleased_body
+    assert "### Fixed" in unreleased_body
+    assert "full-PR round 1" in unreleased_body
     v107 = rest.split("## [1.0.6]", 1)[0]
     assert "Generated-file triage" in v107
     assert "header-only stubs" in v107

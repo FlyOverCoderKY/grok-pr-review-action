@@ -10,6 +10,7 @@ from grok_pr_review.loop import (
     encode_ledger,
     extract_ledger,
     latest_ledger,
+    ledger_for_sha,
     render_agent_context,
     severity_floor,
 )
@@ -270,6 +271,32 @@ def test_latest_ledger_fails_on_a_corrupt_newest_marker_instead_of_rolling_back(
         latest_ledger([older, corrupt], repo="owner/repo", pr_number=7)
     recovered = latest_ledger([corrupt, older], repo="owner/repo", pr_number=7)
     assert recovered is not None and recovered.round_number == 2
+
+
+def test_ledger_for_sha_searches_all_bot_reviews_and_fails_closed() -> None:
+    import pytest
+
+    from grok_pr_review.scope import GhError
+
+    old_sha = "a" * 40
+    new_sha = "b" * 40
+    old = encode_ledger(
+        Ledger(1, (_finding("r1-1"),), reviewed_sha=old_sha),
+        repo="owner/repo",
+        pr_number=7,
+    )
+    new = encode_ledger(Ledger(2, (), reviewed_sha=new_sha), repo="owner/repo", pr_number=7)
+    assert ledger_for_sha(
+        [old, new], repo="owner/repo", pr_number=7, reviewed_sha=old_sha.upper()
+    ) == Ledger(1, (_finding("r1-1"),), reviewed_sha=old_sha)
+    assert ledger_for_sha([old, new], repo="owner/repo", pr_number=7, reviewed_sha="c" * 40) is None
+    with pytest.raises(GhError, match="corrupted"):
+        ledger_for_sha(
+            [old, "<!-- grok-review-ledger:v1:AAAA -->"],
+            repo="owner/repo",
+            pr_number=7,
+            reviewed_sha=old_sha,
+        )
 
 
 def test_decide_loop_state_clamps_the_round_counter() -> None:

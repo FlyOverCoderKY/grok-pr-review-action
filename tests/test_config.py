@@ -21,6 +21,7 @@ def test_action_config_validates_and_normalizes_every_input() -> None:
             "MAX_DIFF_KB": "512",
             "REVIEW_SCOPE": "latest-commit",
             "GITHUB_TIMEOUT_SECONDS": "45",
+            "FORCE_REVIEW": "true",
         }
     )
 
@@ -32,6 +33,7 @@ def test_action_config_validates_and_normalizes_every_input() -> None:
     assert config.status_comments is True
     assert config.review_scope == "latest-commit"
     assert config.github_timeout_seconds == 45
+    assert config.force_review is True
 
 
 @pytest.mark.parametrize(
@@ -49,6 +51,7 @@ def test_action_config_validates_and_normalizes_every_input() -> None:
         ("MAX_DIFF_KB", "0"),
         ("REVIEW_SCOPE", "commit"),
         ("GITHUB_TIMEOUT_SECONDS", "601"),
+        ("FORCE_REVIEW", "sometimes"),
     ],
 )
 def test_action_config_rejects_invalid_values(name: str, value: str) -> None:

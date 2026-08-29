@@ -4,6 +4,14 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## Unreleased
 
+### Added
+
+- Two-phase duplicate suppression checks for an existing bot ledger on the live PR-head SHA before Grok setup and again immediately before posting. This closes the common overlapping `workflow_dispatch` / event race without model spend when the prior verdict is already visible; `force_review: true` is the explicit opt-out for intentional same-code reruns. Because GitHub review creation has no atomic compare-and-swap, one caller-level repo/PR concurrency group with `cancel-in-progress: false` is now an explicit required integration contract; the in-action checks are defense-in-depth.
+
+### Fixed
+
+- A verification whose ledger boundary is proven not to be an ancestor after rewritten history now resets to a freshly pinned full-PR round 1. It no longer reviews only the final rewritten commit at a late-round severity floor or leaves the loop stuck behind a permanently partial fallback. Operational comparison failures (authentication, rate limit, timeout, or API errors) propagate instead of being misclassified as divergence, so they stop before Grok runs and never clear carried state.
+
 ## [1.0.7] - 2026-08-29
 
 ### Added

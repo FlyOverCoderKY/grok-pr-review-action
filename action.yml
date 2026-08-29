@@ -56,13 +56,15 @@ inputs:
     description: "Maximum diff size (KB) embedded in the prompt before truncation."
     required: false
     default: "300"
-  # One invocation = one review. Callers own concurrency and merge
-  # gating (isolate first-pass from synchronize). See README.
+  # One invocation = one review. Every trigger for the same repo/PR must use
+  # one caller-level concurrency group with cancel-in-progress: false. The
+  # in-action same-SHA checks are defense-in-depth, not an atomic lock.
   review_scope:
     description: >-
       Diff to embed: full-pr (gh pr diff) or latest-commit (only the new
-      work on this push). latest-commit never silently falls back to the
-      full PR diff. Initial rounds require full-pr.
+      work on this push). A verify history proven non-linear by GitHub is
+      visibly reset to a fresh full-PR round 1; operational compare failures
+      fail closed. Initial rounds require full-pr.
     required: false
     default: "full-pr"
   review_mode:
@@ -100,23 +102,29 @@ inputs:
       github_token is a PAT or GitHub App token.
     required: false
     default: "github-actions[bot]"
+  force_review:
+    description: >-
+      Bypass same-commit duplicate protection for an intentional rerun.
+      Defaults to false; set true only for an explicit manual re-review.
+    required: false
+    default: "false"
 
 outputs:
   verdict:
     description: "Review verdict: clean | issues | partial | error"
-    value: ${{ steps.finish.outputs.verdict }}
+    value: ${{ steps.finish.outputs.verdict || steps.preflight.outputs.verdict }}
   issue_count:
     description: "Open findings after this round (carried-over plus new)."
-    value: ${{ steps.finish.outputs.issue_count }}
+    value: ${{ steps.finish.outputs.issue_count || steps.preflight.outputs.issue_count }}
   bug_count:
     description: "Open bug-severity findings after this round."
-    value: ${{ steps.finish.outputs.bug_count }}
+    value: ${{ steps.finish.outputs.bug_count || steps.preflight.outputs.bug_count }}
   round:
     description: "Review-loop round number this run performed."
-    value: ${{ steps.finish.outputs.round }}
+    value: ${{ steps.finish.outputs.round || steps.preflight.outputs.round }}
   review_url:
     description: "URL of the posted GitHub review or incomplete-review comment."
-    value: ${{ steps.finish.outputs.review_url }}
+    value: ${{ steps.finish.outputs.review_url || steps.preflight.outputs.review_url }}
 
 runs:
   using: "composite"
@@ -153,21 +161,41 @@ runs:
         VERIFY_EFFORT: ${{ inputs.verify_effort }}
         VERIFY_ESCALATION_LINES: ${{ inputs.verify_escalation_lines }}
         BOT_LOGIN: ${{ inputs.bot_login }}
+        FORCE_REVIEW: ${{ inputs.force_review }}
       run: python3 -m grok_pr_review validate-inputs
 
+    - name: Check for an existing same-commit verdict
+      id: preflight
+      shell: bash
+      env:
+        PYTHONPATH: ${{ github.action_path }}/src
+        WORK: ${{ steps.dirs.outputs.work }}
+        GH_TOKEN: ${{ inputs.github_token }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
+        GITHUB_TIMEOUT_SECONDS: ${{ inputs.github_timeout_seconds }}
+        BOT_LOGIN: ${{ inputs.bot_login }}
+        FORCE_REVIEW: ${{ inputs.force_review }}
+        FAIL_ON: ${{ inputs.fail_on }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: python3 -m grok_pr_review preflight
+
     - name: Require XAI_API_KEY
+      if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
       run: python3 -m grok_pr_review check-auth
 
     - name: Install Grok CLI
+      if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         WORK: ${{ steps.dirs.outputs.work }}
       run: bash "${{ github.action_path }}/scripts/install-grok.sh" "$WORK"
 
     - name: Write Grok config.toml
+      if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
@@ -178,6 +206,7 @@ runs:
 
     - name: Collect PR context
       id: ctx
+      if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
@@ -202,6 +231,7 @@ runs:
       run: python3 -m grok_pr_review collect
 
     - name: Prepare isolated review workspace
+      if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
@@ -215,6 +245,7 @@ runs:
       run: python3 -m grok_pr_review prepare-workspace
 
     - name: Post status comment
+      if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
@@ -230,6 +261,7 @@ runs:
       run: python3 -m grok_pr_review start-status
 
     - name: Build prompt
+      if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
@@ -242,6 +274,7 @@ runs:
       run: python3 -m grok_pr_review prompt
 
     - name: Run Grok review
+      if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         GROK_HOME: ${{ steps.dirs.outputs.grok_home }}
@@ -264,6 +297,7 @@ runs:
 
     - name: Post review
       id: finish
+      if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
@@ -277,6 +311,8 @@ runs:
         STATUS_COMMENTS: ${{ inputs.status_comments }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         GITHUB_TIMEOUT_SECONDS: ${{ inputs.github_timeout_seconds }}
+        BOT_LOGIN: ${{ inputs.bot_login }}
+        FORCE_REVIEW: ${{ inputs.force_review }}
       run: python3 -m grok_pr_review finish
 
     - name: Cleanup temporary files

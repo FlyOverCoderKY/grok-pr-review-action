@@ -19,8 +19,9 @@ MISSING_BEFORE_NOTICE = (
     "This is not a full-PR review and the full pull request diff was not fetched."
 )
 
-COMPARE_FAILED_NOTICE = (
-    "The before...after compare failed (missing history or a force-push). "
+HISTORY_DIVERGED_NOTICE = (
+    "The before...after comparison proved the ledger boundary is not an "
+    "ancestor of the current PR head. "
     "This prompt embeds only the single latest commit on the PR head. "
     "This is not a full-PR review and the full pull request diff was not fetched."
 )
@@ -28,6 +29,10 @@ COMPARE_FAILED_NOTICE = (
 
 class GhError(RuntimeError):
     """A GitHub CLI/API call failed."""
+
+
+class HistoryDiverged(GhError):
+    """GitHub proved that a commit range is not a linear fast-forward."""
 
 
 class GitHubPort(Protocol):
@@ -358,8 +363,8 @@ def fetch_scoped_diff(
             raise GhError("commit-range plan is missing SHAs")
         try:
             return github.compare_diff(plan.from_sha, plan.to_sha), plan
-        except GhError:
-            fallback = plan.as_single_commit_fallback(COMPARE_FAILED_NOTICE)
+        except HistoryDiverged:
+            fallback = plan.as_single_commit_fallback(HISTORY_DIVERGED_NOTICE)
             if not fallback.to_sha:
                 raise GhError("latest-commit fallback is missing a head SHA") from None
             return github.commit_diff(fallback.to_sha), fallback

@@ -8,7 +8,7 @@ import pytest
 
 from grok_pr_review.github import STATUS_MARKER, GitHubCli
 from grok_pr_review.result import MAX_GITHUB_BODY_BYTES, Issue, ReviewResult
-from grok_pr_review.scope import GhError
+from grok_pr_review.scope import GhError, HistoryDiverged
 
 
 class StubGitHub(GitHubCli):
@@ -55,9 +55,15 @@ def test_compare_diff_requires_a_linear_ahead_range() -> None:
 
     diverged = StubGitHub()
     diverged.responses = [json.dumps({"status": "diverged", "behind_by": 2})]
-    with pytest.raises(GhError, match="not a linear"):
+    with pytest.raises(HistoryDiverged, match="not a linear"):
         diverged.compare_diff("a" * 40, "b" * 40)
     assert len(diverged.calls) == 1
+
+    failed = StubGitHub()
+    failed.responses = [GhError("rate limited")]
+    with pytest.raises(GhError, match="rate limited") as raised:
+        failed.compare_diff("a" * 40, "b" * 40)
+    assert not isinstance(raised.value, HistoryDiverged)
 
 
 def test_post_review_falls_back_to_body_when_inline_comment_is_rejected() -> None:
