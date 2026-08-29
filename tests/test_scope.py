@@ -9,6 +9,7 @@ from grok_pr_review.scope import (
     MISSING_BEFORE_NOTICE,
     DiffRequest,
     GhError,
+    changed_paths,
     collect_review_material,
     plan_diff,
     truncate_diff,
@@ -224,6 +225,76 @@ def test_truncate_diff_never_discards_most_of_the_budget() -> None:
     assert result.embedded_bytes <= 1024
     assert result.embedded_bytes > 512
     assert "big.py" in result.text
+
+
+def _file_diff(path: str, lines: int, marker: str = "+data") -> str:
+    return f"diff --git a/{path} b/{path}\n@@ -1,1 +1,{lines} @@\n" + (f"{marker}\n" * lines)
+
+
+def test_truncate_diff_stubs_lock_files_when_over_the_cap() -> None:
+    source = _file_diff("src/app.py", 20, "+code")
+    lock = _file_diff("package-lock.json", 300)
+    result = truncate_diff(source + lock, max_diff_kb=1)
+    assert result.truncated is True
+    assert result.hard_cut is False
+    assert result.stubbed_paths == ("package-lock.json",)
+    assert "+code" in result.text
+    assert "+data" not in result.text
+    assert "diff --git a/package-lock.json b/package-lock.json" in result.text
+    assert "hunk(s)" in result.text and "omitted" in result.text
+    assert changed_paths(result.text) == {"src/app.py", "package-lock.json"}
+    notice = result.notice or ""
+    assert "truncated" in notice.lower()
+    assert "package-lock.json" in notice
+    assert "Every file is present" in notice
+
+
+def test_truncate_diff_never_stubs_a_diff_that_fits() -> None:
+    diff = _file_diff("package-lock.json", 50)
+    result = truncate_diff(diff, max_diff_kb=300)
+    assert result.truncated is False
+    assert result.text == diff
+    assert result.stubbed_paths == ()
+
+
+def test_truncate_diff_stubs_large_data_files_but_keeps_small_ones() -> None:
+    from grok_pr_review.scope import LARGE_DATA_STUB_BYTES
+
+    big_lines = LARGE_DATA_STUB_BYTES // 6 + 100
+    snapshot = _file_diff("src/data/rule-coverage.json", big_lines)
+    small_json = _file_diff("src/config/settings.json", 10, "+conf")
+    source = _file_diff("src/app.py", 10, "+code")
+    result = truncate_diff(snapshot + small_json + source, max_diff_kb=64)
+    assert result.stubbed_paths == ("src/data/rule-coverage.json",)
+    assert result.hard_cut is False
+    assert "+conf" in result.text
+    assert "+code" in result.text
+    assert changed_paths(result.text) == {
+        "src/data/rule-coverage.json",
+        "src/config/settings.json",
+        "src/app.py",
+    }
+
+
+def test_truncate_diff_stubs_vendored_and_minified_paths() -> None:
+    vendored = _file_diff("vendor/lib/util.py", 300)
+    minified = _file_diff("assets/app.min.js", 300)
+    source = _file_diff("src/app.py", 10, "+code")
+    result = truncate_diff(vendored + minified + source, max_diff_kb=2)
+    assert set(result.stubbed_paths) == {"vendor/lib/util.py", "assets/app.min.js"}
+    assert "+code" in result.text
+
+
+def test_truncate_diff_still_cuts_when_stubbing_is_not_enough() -> None:
+    lock = _file_diff("package-lock.json", 100)
+    source = _file_diff("src/app.py", 2000, "+code")
+    result = truncate_diff(lock + source, max_diff_kb=1)
+    assert result.truncated is True
+    assert result.hard_cut is True
+    assert result.stubbed_paths == ("package-lock.json",)
+    assert result.embedded_bytes <= 1024
+    notice = result.notice or ""
+    assert "Later files/hunks are missing." in notice
 
 
 def test_full_pr_fails_with_accurate_error_when_head_is_missing() -> None:

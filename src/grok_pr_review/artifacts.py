@@ -34,6 +34,8 @@ class ReviewContext:
     original_bytes: int
     embedded_bytes: int
     max_diff_kb: int
+    stubbed_paths: tuple[str, ...] = ()
+    hard_cut: bool = False
     loop: LoopState | None = None
 
     @classmethod
@@ -48,6 +50,8 @@ class ReviewContext:
             original_bytes=truncation.original_bytes,
             embedded_bytes=truncation.embedded_bytes,
             max_diff_kb=truncation.max_diff_kb,
+            stubbed_paths=truncation.stubbed_paths,
+            hard_cut=truncation.hard_cut,
             loop=loop,
         )
 
@@ -105,6 +109,12 @@ class ReviewContext:
             raise ArtifactError("truncated context must omit at least one byte")
         if not truncated and embedded_bytes != original_bytes:
             raise ArtifactError("untruncated context must preserve every byte")
+        stubbed_paths = _stubbed_paths(truncation.get("stubbed_paths", []))
+        hard_cut = truncation.get("hard_cut", False)
+        if not isinstance(hard_cut, bool):
+            raise ArtifactError("truncation.hard_cut must be a boolean")
+        if (stubbed_paths or hard_cut) and not truncated:
+            raise ArtifactError("stubbed or hard-cut context must be marked truncated")
 
         return cls(
             pr=pr,
@@ -119,6 +129,8 @@ class ReviewContext:
             original_bytes=original_bytes,
             embedded_bytes=embedded_bytes,
             max_diff_kb=max_diff_kb,
+            stubbed_paths=stubbed_paths,
+            hard_cut=hard_cut,
             loop=_loop_state(data.get("loop")),
         )
 
@@ -176,6 +188,8 @@ class ReviewContext:
                 "original_bytes": self.original_bytes,
                 "embedded_bytes": self.embedded_bytes,
                 "max_diff_kb": self.max_diff_kb,
+                "stubbed_paths": list(self.stubbed_paths),
+                "hard_cut": self.hard_cut,
             },
             "loop": loop_value,
         }
@@ -196,6 +210,8 @@ class ReviewContext:
                 original_bytes=self.original_bytes,
                 embedded_bytes=self.embedded_bytes,
                 max_diff_kb=self.max_diff_kb,
+                stubbed_paths=self.stubbed_paths,
+                hard_cut=self.hard_cut,
             ),
         )
 
@@ -207,6 +223,8 @@ class ReviewContext:
             original_bytes=self.original_bytes,
             embedded_bytes=self.embedded_bytes,
             max_diff_kb=self.max_diff_kb,
+            stubbed_paths=self.stubbed_paths,
+            hard_cut=self.hard_cut,
         ).notice
 
 
@@ -283,6 +301,17 @@ def _optional_full_sha(value: object, name: str) -> str | None:
     if value is None:
         return None
     return _full_sha(value, name)
+
+
+def _stubbed_paths(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        raise ArtifactError("truncation.stubbed_paths must be an array")
+    paths: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ArtifactError("truncation.stubbed_paths must contain non-empty strings")
+        paths.append(item.strip())
+    return tuple(paths)
 
 
 def _nonnegative_int(value: object, name: str) -> int:

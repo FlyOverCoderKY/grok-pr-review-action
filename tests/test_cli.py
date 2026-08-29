@@ -941,6 +941,44 @@ def test_initial_finish_keeps_truncated_out_of_embed_findings_as_partial(
     assert "omitted from the truncated embed" in (github.result.partial_reason or "")
 
 
+def test_finish_names_stubbed_files_in_the_partial_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    diff = "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n+x\n"
+    envelope = {
+        "text": json.dumps(
+            {
+                "summary": "Reviewed the embed; the snapshot file was stubbed.",
+                "issues": [],
+                "coverage": [{"path": "src/app.py", "findings": 0}],
+            }
+        ),
+        "stopReason": "EndTurn",
+    }
+    (tmp_path / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
+    (tmp_path / "grok-exit").write_text("0", encoding="utf-8")
+    (tmp_path / "diff.patch").write_text(diff, encoding="utf-8")
+    ReviewContext(
+        pr={"number": 7, "headRefOid": REVIEWED_SHA},
+        plan=DiffPlan("full-pr", "full-pr", None, REVIEWED_SHA, None),
+        truncated=True,
+        original_bytes=1_206_580,
+        embedded_bytes=len(diff.encode("utf-8")),
+        max_diff_kb=300,
+        stubbed_paths=("src/data/ground-truth/rule-coverage.json",),
+    ).write(tmp_path / "review-context.json")
+    _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 0
+    assert github.result is not None
+    assert github.result.verdict == "partial"
+    reason = github.result.partial_reason or ""
+    assert "src/data/ground-truth/rule-coverage.json" in reason
+    assert "Every file is present" in reason
+
+
 def test_initial_finish_of_a_truncated_dense_pr_degrades_to_partial(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

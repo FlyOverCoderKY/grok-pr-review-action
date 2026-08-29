@@ -4,6 +4,10 @@ This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) an
 
 ## Unreleased
 
+### Added
+
+- Generated-file triage for over-cap diffs: when a diff exceeds `max_diff_kb`, generated and vendored files (lock files, `node_modules/` / `vendor/` / `__generated__/` paths, minified assets, source maps, snapshots) and data files whose own diff exceeds 64 KB (`.json`, `.csv`, `.svg`, `.d.ts`, …) are embedded as header-only stubs before any positional cut, so hand-written source stays fully embedded. Stubbed files keep their `diff --git` header — they remain in the embedded diff's path set and the coverage contract — and each stub carries a visible note with the omitted hunk and byte counts. The review still posts `verdict=partial`, and the partial warning names the stubbed files. A diff that already fits the cap is never stubbed. Reference case: retiregolden.org#108's 1178 KB diff now embeds as 60 KB with every changed file present, instead of losing 6 of its 10 paths to the positional cut.
+
 ## [1.0.6] - 2026-08-28
 
 ### Fixed
