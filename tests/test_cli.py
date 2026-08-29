@@ -941,6 +941,79 @@ def test_initial_finish_keeps_truncated_out_of_embed_findings_as_partial(
     assert "omitted from the truncated embed" in (github.result.partial_reason or "")
 
 
+def test_initial_finish_of_a_truncated_dense_pr_degrades_to_partial(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Replay of RetireGolden/retiregolden.org#108: a 1178 KB diff truncated to
+    # 300 KB, with Grok reviewing the whole PR through its read-only tools. Its
+    # coverage cites files the embed omitted and misses an embedded file whose
+    # hunks were cut. The completed review must post with a usable partial
+    # verdict instead of erroring the required first-pass gate.
+    diff = (
+        "diff --git a/src/app.py b/src/app.py\n--- a/src/app.py\n+++ b/src/app.py\n+x\n"
+        "diff --git a/src/cut.py b/src/cut.py\n--- a/src/cut.py\n+++ b/src/cut.py\n+y\n"
+    )
+    envelope = {
+        "text": json.dumps(
+            {
+                "summary": "Reviewed the whole PR with tools; the embed was truncated.",
+                "issues": [
+                    {
+                        "severity": "bug",
+                        "path": "src/lib/ground-truth.ts",
+                        "line": 10,
+                        "title": "Wrong rule",
+                        "detail": "File fell outside the truncated embed.",
+                    },
+                    {
+                        "severity": "risk",
+                        "path": "src/app.py",
+                        "line": 4,
+                        "title": "Unchecked input",
+                        "detail": "In the embedded diff.",
+                    },
+                ],
+                "coverage": [
+                    {"path": "src/app.py", "findings": 1},
+                    {"path": "src/lib/ground-truth.ts", "findings": 1},
+                    {"path": "src/pages/methodology/tax-rules.astro", "findings": 0},
+                ],
+            }
+        ),
+        "stopReason": "EndTurn",
+    }
+    (tmp_path / "grok-output.json").write_text(json.dumps(envelope), encoding="utf-8")
+    (tmp_path / "grok-exit").write_text("0", encoding="utf-8")
+    (tmp_path / "diff.patch").write_text(diff, encoding="utf-8")
+    ReviewContext(
+        pr={"number": 7, "headRefOid": REVIEWED_SHA},
+        plan=DiffPlan("full-pr", "full-pr", None, REVIEWED_SHA, None),
+        truncated=True,
+        original_bytes=1_206_580,
+        embedded_bytes=len(diff.encode("utf-8")),
+        max_diff_kb=300,
+    ).write(tmp_path / "review-context.json")
+    output = _set_finish_env(monkeypatch, tmp_path)
+    github = RecordingGitHub()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    assert cli.cmd_finish() == 0
+    assert github.incomplete_result is None
+    assert github.result is not None
+    assert github.result.verdict == "partial"
+    assert [issue.path for issue in github.result.issues] == [
+        "src/lib/ground-truth.ts",
+        "src/app.py",
+    ]
+    reason = github.result.partial_reason or ""
+    assert "Coverage could not be validated against the truncated embed" in reason
+    assert "src/cut.py" in reason
+    assert "omitted from the truncated embed" in reason
+    assert "verdict=partial" in output.read_text(encoding="utf-8")
+    posted = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert posted["verdict"] == "partial"
+
+
 def test_verify_finish_keeps_new_findings_outside_the_embedded_diff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -306,6 +306,8 @@ def _output_contract_lines(context: PromptContext) -> list[str]:
                 "- `coverage` must list EVERY file that appears in the embedded diff with",
                 "  the number of findings you report in it, including zeros. A file you",
                 "  cannot account for means your review is not finished.",
+                "- List only embedded-diff files in `coverage`. Files you examined with",
+                "  tools that are not in the embedded diff belong in `issues` only.",
             ]
         )
     return lines

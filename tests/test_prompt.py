@@ -132,6 +132,7 @@ def test_initial_prompt_demands_exhaustive_recall_and_coverage() -> None:
     assert "Sweep every file and every hunk" in prompt
     assert '"coverage"' in prompt
     assert "including zeros" in prompt
+    assert "List only embedded-diff files in `coverage`" in prompt
     assert '"resolutions"' not in prompt
 
 

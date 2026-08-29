@@ -117,7 +117,10 @@ def test_changelog_dates_1_0_0_and_documents_review_loop() -> None:
     assert "verify_model" in text
     assert "review_mode" in text
     unreleased, rest = text.split("## [1.0.5]", 1)
-    assert "###" not in unreleased.split("## Unreleased", 1)[1]
+    unreleased_section = unreleased.split("## Unreleased", 1)[1]
+    assert "truncated embed" in unreleased_section
+    assert "verdict=partial" in unreleased_section
+    assert "retiregolden.org#108" in unreleased_section
     v105 = rest.split("## [1.0.4]", 1)[0]
     assert "coverage manifest count" in v105
     assert "verdict=error" in v105

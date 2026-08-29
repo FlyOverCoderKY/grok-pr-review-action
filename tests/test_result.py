@@ -321,6 +321,24 @@ def test_coverage_allows_findings_outside_the_embedded_diff() -> None:
     ]
 
 
+def test_coverage_entries_outside_the_embed_do_not_invalidate() -> None:
+    from grok_pr_review.result import validate_coverage
+
+    result = ReviewResult(
+        verdict="issues",
+        summary="Tool-assisted review accounted for files the truncated embed omitted.",
+        issues=[
+            Issue("bug", "src/lib/ground-truth.ts", 10, "Wrong rule", "Reviewed via tools."),
+        ],
+        coverage=[
+            ("src/app.py", 0),
+            ("src/lib/ground-truth.ts", 1),
+            ("src/pages/methodology/tax-rules.astro", 0),
+        ],
+    )
+    assert validate_coverage(result, {"src/app.py"}) is None
+
+
 def test_coverage_count_mismatch_keeps_findings_and_is_not_error() -> None:
     from grok_pr_review.result import (
         coverage_count_mismatches,

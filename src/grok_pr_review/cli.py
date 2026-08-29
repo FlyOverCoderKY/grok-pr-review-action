@@ -394,6 +394,16 @@ def cmd_finish() -> int:
         validation_error = (
             validate_coverage(result, diff_paths) if state.mode == "initial" else None
         )
+        if validation_error and context.truncated:
+            # A truncated embed cannot be fully accounted for (its last file
+            # may be cut mid-hunk), and the result is already partial, which
+            # never publishes ledger state. Degrade instead of discarding the
+            # completed review behind a permanently red required check.
+            result = mark_partial(
+                result,
+                f"Coverage could not be validated against the truncated embed: {validation_error}.",
+            )
+            validation_error = None
         if validation_error:
             result = ReviewResult(
                 verdict="error",
