@@ -566,10 +566,12 @@ def validate_coverage(result: ReviewResult, diff_paths: set[str]) -> str | None:
     """Reject an initial review whose coverage manifest does not account for the embed.
 
     Coverage is required only for files that appear in the embedded diff.
-    Findings on other paths are kept and do not fail this check. Per-file
-    counts that do not match the findings kept for those files are not a
-    parse error; use coverage_count_mismatches() to surface a note while
-    keeping a completed verdict.
+    Findings on other paths are kept and do not fail this check, and coverage
+    entries for files outside the embedded diff are ignored: a tool-assisted
+    review of a truncated dense PR legitimately accounts for files the embed
+    omitted. Per-file counts that do not match the findings kept for those
+    files are not a parse error; use coverage_count_mismatches() to surface a
+    note while keeping a completed verdict.
     """
     if not diff_paths:
         return None
@@ -580,10 +582,6 @@ def validate_coverage(result: ReviewResult, diff_paths: set[str]) -> str | None:
     if missing:
         named = ", ".join(missing[:5])
         return f"coverage does not account for {len(missing)} diff file(s): {named}"
-    extra = sorted(set(covered) - diff_paths)
-    if extra:
-        named = ", ".join(extra[:5])
-        return f"coverage lists file(s) not in the embedded diff: {named}"
     return None
 
 
