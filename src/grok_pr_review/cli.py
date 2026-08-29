@@ -46,6 +46,7 @@ from grok_pr_review.loop import (
     decide_loop_state,
     encode_ledger,
     latest_ledger,
+    ledger_for_sha,
     render_agent_context,
 )
 from grok_pr_review.prompt import build_prompt_from_collected
@@ -62,6 +63,7 @@ from grok_pr_review.result import (
     validate_coverage,
 )
 from grok_pr_review.scope import (
+    HISTORY_DIVERGED_NOTICE,
     CollectedReview,
     DiffRequest,
     GhError,
@@ -76,6 +78,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="grok-pr-review")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("validate-inputs", help="Validate every composite-action input")
+    sub.add_parser("preflight", help="Skip a duplicate review of an already-ledgered SHA")
     sub.add_parser("check-auth", help="Fail closed when XAI_API_KEY is empty")
     sub.add_parser("write-config", help="Write GROK_HOME/config.toml for api.x.ai")
     sub.add_parser("collect", help="Fetch PR metadata and the scoped diff")
@@ -87,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
 
     commands = {
         "check-auth": cmd_check_auth,
+        "preflight": cmd_preflight,
         "validate-inputs": cmd_validate_inputs,
         "write-config": cmd_write_config,
         "collect": cmd_collect,
@@ -115,6 +119,67 @@ def cmd_validate_inputs() -> int:
 def cmd_check_auth() -> int:
     require_xai_api_key()
     print("XAI_API_KEY is set (value not printed).")
+    return 0
+
+
+def cmd_preflight() -> int:
+    """Avoid model spend when this bot already reviewed the live PR head."""
+    if parse_bool(os.environ.get("FORCE_REVIEW", "false"), "force_review"):
+        _write_preflight_outputs(skip=False)
+        print("Duplicate-review protection bypassed by force_review=true.")
+        return 0
+
+    pr_number = _pr_number()
+    repo = _require_env("GITHUB_REPOSITORY")
+    bot_login = parse_bot_login(os.environ.get("BOT_LOGIN", DEFAULT_BOT_LOGIN))
+    github = _github()
+    try:
+        pr = github.pr_view(pr_number)
+        head = normalize_sha(_maybe_str(pr.get("headRefOid")))
+        if head is None:
+            raise GhError("current PR head SHA is missing")
+        ledger = ledger_for_sha(
+            github.list_bot_review_bodies(pr_number, bot_login),
+            repo=repo,
+            pr_number=pr_number,
+            reviewed_sha=head,
+        )
+    except GhError as exc:
+        _report_pipeline_failure("duplicate-review preflight", exc)
+        raise
+
+    if ledger is None:
+        _write_preflight_outputs(skip=False)
+        print(f"No ledgered verdict exists for {head[:12]}; review will run.")
+        return 0
+
+    open_findings = [finding for finding in ledger.findings if finding.status == "open"]
+    bug_count = sum(finding.severity == "bug" for finding in open_findings)
+    duplicate_result = ReviewResult(
+        verdict="issues" if open_findings else "clean",
+        summary="Reused the existing ledgered verdict for this commit.",
+    )
+    verdict = duplicate_result.verdict
+    _write_preflight_outputs(
+        skip=True,
+        verdict=verdict,
+        issue_count=len(open_findings),
+        bug_count=bug_count,
+        round_number=ledger.round_number,
+    )
+    print(
+        f"Skipping duplicate review: {head[:12]} already has a ledgered "
+        f"round {ledger.round_number} verdict ({verdict})."
+    )
+    fail_on = parse_fail_on(os.environ.get("FAIL_ON", "never"))
+    if should_fail_job(
+        fail_on,
+        duplicate_result,
+        open_bug_count=bug_count,
+        open_issue_count=len(open_findings),
+    ):
+        print(f"Failing the job because the ledgered verdict violates fail_on={fail_on}.")
+        return 1
     return 0
 
 
@@ -167,6 +232,37 @@ def cmd_collect() -> int:
     except (GhError, ValueError) as exc:
         _report_pipeline_failure("diff collection", exc)
         raise
+    if (
+        mode == "verify"
+        and collected.plan.kind == "single-commit"
+        and collected.plan.fallback_notice == HISTORY_DIVERGED_NOTICE
+    ):
+        # The previous ledger SHA is no longer an ancestor of the PR head.
+        # A one-commit, late-round verification would miss the rewritten PR
+        # and apply an inappropriately high severity floor. Reset from a
+        # freshly pinned full-PR diff instead.
+        print(
+            "Review history diverged from the ledger boundary; resetting to "
+            "a fresh full-PR round 1."
+        )
+        try:
+            collected = collect_review_material(
+                pr_number=pr_number,
+                request=DiffRequest(
+                    scope="full-pr",
+                    before_sha=None,
+                    after_sha=None,
+                    head_sha=head,
+                ),
+                max_diff_kb=max_diff_kb,
+                github=github,
+            )
+        except (GhError, ValueError) as exc:
+            _report_pipeline_failure("history-divergence full-PR reset", exc)
+            raise
+        ledger = None
+        mode = "initial"
+        round_number = 1
     state = _stage_loop_inputs(
         work,
         github,
@@ -366,18 +462,21 @@ def cmd_start_status() -> int:
 class FinishOutcome:
     result: ReviewResult
     review_url: str
+    duplicate_ledger: Ledger | None = None
 
 
 def cmd_finish() -> int:
     work = _work_dir()
     pr_number = _pr_number()
     fail_on = parse_fail_on(os.environ.get("FAIL_ON", "never"))
-    scope = parse_review_scope(os.environ.get("REVIEW_SCOPE", "full-pr"))
     model = parse_model(os.environ.get("MODEL", "grok-4.6"))
     model_used = parse_optional_model(_read_optional(work / "model-override").strip()) or model
     run_url = os.environ.get("RUN_URL", "")
     status_comments = parse_bool(os.environ.get("STATUS_COMMENTS", "true"), "status_comments")
     context = ReviewContext.read(work / "review-context.json")
+    # Collection may promote a divergent latest-commit verification to a
+    # fresh full-PR review. Label the result with what was actually reviewed.
+    scope = context.plan.scope
     result = _parse_finish_result(work, context)
     loop_outcome: RoundOutcome | None = None
     diff_paths: set[str] = set()
@@ -489,18 +588,57 @@ def _post_finish_result(
 ) -> FinishOutcome:
     review_url = ""
     try:
+        commit_id = normalize_sha(context.plan.to_sha)
+        live_head: str | None = None
+        if commit_id is not None and not parse_bool(
+            os.environ.get("FORCE_REVIEW", "false"), "force_review"
+        ):
+            live_pr = github.pr_view(pr_number)
+            live_head = normalize_sha(_maybe_str(live_pr.get("headRefOid")))
+            if live_head is None:
+                raise GhError("current PR head SHA is missing")
+            if live_head == commit_id:
+                duplicate = ledger_for_sha(
+                    github.list_bot_review_bodies(
+                        pr_number,
+                        parse_bot_login(os.environ.get("BOT_LOGIN", DEFAULT_BOT_LOGIN)),
+                    ),
+                    repo=_require_env("GITHUB_REPOSITORY"),
+                    pr_number=pr_number,
+                    reviewed_sha=commit_id,
+                )
+                if duplicate is not None:
+                    open_findings = [
+                        finding for finding in duplicate.findings if finding.status == "open"
+                    ]
+                    duplicate_result = ReviewResult(
+                        verdict="issues" if open_findings else "clean",
+                        summary=(
+                            "Skipped duplicate review because this bot already "
+                            "published a ledgered verdict for the same commit."
+                        ),
+                    )
+                    print(
+                        f"Suppressing duplicate post for {commit_id[:12]}; "
+                        f"round {duplicate.round_number} is already ledgered."
+                    )
+                    return FinishOutcome(
+                        result=duplicate_result,
+                        review_url="",
+                        duplicate_ledger=duplicate,
+                    )
         if result.incomplete:
             review_url = github.post_incomplete(
                 pr_number, result, scope=scope, model=model, run_url=run_url
             )
             print(result.incomplete_reason or "Review incomplete.")
         else:
-            commit_id = normalize_sha(context.plan.to_sha)
             if commit_id is None:
                 raise GhError("reviewed commit SHA is missing")
 
-            live_pr = github.pr_view(pr_number)
-            live_head = normalize_sha(_maybe_str(live_pr.get("headRefOid")))
+            if live_head is None:
+                live_pr = github.pr_view(pr_number)
+                live_head = normalize_sha(_maybe_str(live_pr.get("headRefOid")))
             if live_head is None:
                 raise GhError("current PR head SHA is missing")
             stale = live_head != commit_id
@@ -564,7 +702,15 @@ def _finalize_finish(
     round_number: int = 1,
 ) -> int:
     result = outcome.result
-    if loop_outcome is not None and not result.incomplete:
+    if outcome.duplicate_ledger is not None:
+        counting_open = True
+        open_findings = [
+            finding for finding in outcome.duplicate_ledger.findings if finding.status == "open"
+        ]
+        issue_count = len(open_findings)
+        bug_count = sum(finding.severity == "bug" for finding in open_findings)
+        round_number = outcome.duplicate_ledger.round_number
+    elif loop_outcome is not None and not result.incomplete:
         counting_open = True
         issue_count = loop_outcome.open_issue_count
         bug_count = loop_outcome.open_bug_count
@@ -580,6 +726,7 @@ def _finalize_finish(
         scope,
         outcome.review_url,
         enabled=status_comments,
+        duplicate=outcome.duplicate_ledger is not None,
     )
     _write_outputs(
         result,
@@ -598,6 +745,7 @@ def _finalize_finish(
                 "review_url": outcome.review_url,
                 "incomplete_reason": result.incomplete_reason,
                 "partial_reason": result.partial_reason,
+                "duplicate_suppressed": outcome.duplicate_ledger is not None,
             },
             indent=2,
         ),
@@ -625,11 +773,18 @@ def _update_status(
     review_url: str,
     *,
     enabled: bool,
+    duplicate: bool = False,
 ) -> None:
     if not enabled:
         return
     ident = _read_optional(work / "status-comment-id").strip()
-    summary = f"Grok review finished: `{result.verdict}` (scope `{scope}`)."
+    if duplicate:
+        summary = (
+            f"Grok duplicate review skipped: `{result.verdict}` already ledgered "
+            f"for this commit (scope `{scope}`)."
+        )
+    else:
+        summary = f"Grok review finished: `{result.verdict}` (scope `{scope}`)."
     if review_url:
         summary += f"\n\n{review_url}"
     if result.incomplete_reason:
@@ -660,6 +815,27 @@ def _write_outputs(
         handle.write(f"bug_count={bug_count}\n")
         handle.write(f"round={round_number}\n")
         handle.write(f"review_url={review_url}\n")
+
+
+def _write_preflight_outputs(
+    *,
+    skip: bool,
+    verdict: str = "",
+    issue_count: int = 0,
+    bug_count: int = 0,
+    round_number: int = 0,
+) -> None:
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path:
+        return
+    with Path(output_path).open("a", encoding="utf-8") as handle:
+        handle.write(f"skip={'true' if skip else 'false'}\n")
+        if skip:
+            handle.write(f"verdict={verdict}\n")
+            handle.write(f"issue_count={issue_count}\n")
+            handle.write(f"bug_count={bug_count}\n")
+            handle.write(f"round={round_number}\n")
+            handle.write("review_url=\n")
 
 
 def _report_pipeline_failure(stage: str, exc: Exception) -> None:

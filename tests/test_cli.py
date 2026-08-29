@@ -212,6 +212,7 @@ def test_prepare_workspace_command_uses_the_reviewed_commit_without_a_manifest(
     ("command", "attribute"),
     [
         ("validate-inputs", "cmd_validate_inputs"),
+        ("preflight", "cmd_preflight"),
         ("check-auth", "cmd_check_auth"),
         ("write-config", "cmd_write_config"),
         ("collect", "cmd_collect"),
@@ -708,6 +709,233 @@ def test_collect_verify_round_reads_ledger_and_stages_verify_inputs(
     replies = (work / "agent-replies.md").read_text(encoding="utf-8")
     assert "Reply to finding r1-1 (from codex-agent):" in replies
     assert "PR comment (from nathan):" in replies
+
+
+def test_preflight_and_prepost_guards_stop_a_concurrent_same_sha_wave(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR351: a dispatch that starts before the first run posts cannot post later."""
+    from grok_pr_review.loop import Ledger, LedgerFinding, encode_ledger
+
+    ledger = Ledger(
+        1,
+        (LedgerFinding("r1-1", "bug", "src/app.py", 3, "Crash", "open"),),
+        reviewed_sha=REVIEWED_SHA,
+    )
+    marker = encode_ledger(ledger, repo="owner/repo", pr_number=7)
+
+    class RacingGitHub(RecordingGitHub):
+        def __init__(self) -> None:
+            super().__init__()
+            self.bodies: list[str] = []
+
+        def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+            return self.bodies
+
+    github = RacingGitHub()
+    output = tmp_path / "outputs"
+    for name, value in {
+        "WORK": str(tmp_path),
+        "PR_NUMBER": "7",
+        "GITHUB_REPOSITORY": "owner/repo",
+        "GITHUB_OUTPUT": str(output),
+        "STATUS_COMMENTS": "false",
+        "FAIL_ON": "never",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(cli, "_github", lambda: github)
+
+    # Both concurrent jobs initially see no ledger, so the second is allowed
+    # to start. The first job posts while the second model call is in flight.
+    assert cli.cmd_preflight() == 0
+    assert "skip=false" in output.read_text(encoding="utf-8")
+    github.bodies = [marker]
+    _write_completed_run(tmp_path)
+
+    assert cli.cmd_finish() == 0
+    assert github.commit_id is None
+    result = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert result["duplicate_suppressed"] is True
+    assert result["round"] == 1
+    assert result["issue_count"] == 1
+    written = output.read_text(encoding="utf-8")
+    assert "verdict=issues" in written
+    assert "bug_count=1" in written
+
+
+def test_preflight_skips_before_model_setup_and_force_review_bypasses_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grok_pr_review.loop import Ledger, LedgerFinding, encode_ledger
+
+    marker = encode_ledger(Ledger(2, (), reviewed_sha=REVIEWED_SHA), repo="owner/repo", pr_number=7)
+
+    class AlreadyReviewed(RecordingGitHub):
+        def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+            return [marker]
+
+    output = tmp_path / "outputs"
+    for name, value in {
+        "PR_NUMBER": "7",
+        "GITHUB_REPOSITORY": "owner/repo",
+        "GITHUB_OUTPUT": str(output),
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(cli, "_github", lambda: AlreadyReviewed())
+
+    assert cli.cmd_preflight() == 0
+    written = output.read_text(encoding="utf-8")
+    assert "skip=true" in written
+    assert "verdict=clean" in written
+    assert "round=2" in written
+
+    output.unlink()
+    issues_marker = encode_ledger(
+        Ledger(
+            3,
+            (LedgerFinding("r1-1", "bug", "src/app.py", 3, "Crash", "open"),),
+            reviewed_sha=REVIEWED_SHA,
+        ),
+        repo="owner/repo",
+        pr_number=7,
+    )
+
+    class AlreadyReviewedWithBug(RecordingGitHub):
+        def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+            return [issues_marker]
+
+    monkeypatch.setenv("FAIL_ON", "bugs")
+    monkeypatch.setattr(cli, "_github", lambda: AlreadyReviewedWithBug())
+    assert cli.cmd_preflight() == 1
+    assert "skip=true" in output.read_text(encoding="utf-8")
+
+    output.unlink()
+    monkeypatch.setenv("FORCE_REVIEW", "true")
+    monkeypatch.setattr(cli, "_github", lambda: pytest.fail("force override should skip reads"))
+    assert cli.cmd_preflight() == 0
+    assert output.read_text(encoding="utf-8") == "skip=false\n"
+
+
+def test_history_divergence_resets_verify_to_a_full_pr_round_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PR354: never review one rewritten commit at a round-three bug floor."""
+    from grok_pr_review.loop import Ledger, LedgerFinding, encode_ledger
+    from grok_pr_review.scope import HISTORY_DIVERGED_NOTICE
+
+    old_sha = "a" * 40
+    head = "b" * 40
+    prior = encode_ledger(
+        Ledger(
+            2,
+            (LedgerFinding("r1-1", "risk", "src/app.py", 3, "Race", "open"),),
+            reviewed_sha=old_sha,
+        ),
+        repo="owner/repo",
+        pr_number=7,
+    )
+    work = tmp_path / "work"
+    for name, value in {
+        "WORK": str(work),
+        "PR_NUMBER": "7",
+        "REVIEW_SCOPE": "latest-commit",
+        "MAX_DIFF_KB": "300",
+        "HEAD_SHA": head,
+        "EVENT_ACTION": "synchronize",
+        "GITHUB_REPOSITORY": "owner/repo",
+        "VERIFY_MODEL": "grok-cheap",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+
+    class DivergedGitHub:
+        def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+            return [prior]
+
+    monkeypatch.setattr(cli, "_github", DivergedGitHub)
+    scopes: list[str] = []
+
+    def collect(**kwargs: Any) -> CollectedReview:
+        scope = kwargs["request"].scope
+        scopes.append(scope)
+        if scope == "latest-commit":
+            assert kwargs["request"].before_sha == old_sha
+            return CollectedReview(
+                pr={"number": 7, "headRefOid": head},
+                plan=DiffPlan(
+                    "latest-commit", "single-commit", None, head, HISTORY_DIVERGED_NOTICE
+                ),
+                truncation=Truncation("diff --git a/last b/last\n+x\n", False, 30, 30, 300),
+            )
+        return CollectedReview(
+            pr={"number": 7, "headRefOid": head},
+            plan=DiffPlan("full-pr", "full-pr", None, head, None),
+            truncation=Truncation("diff --git a/all b/all\n+x\n", False, 28, 28, 300),
+        )
+
+    monkeypatch.setattr(cli, "collect_review_material", collect)
+    assert cli.cmd_collect() == 0
+    assert scopes == ["latest-commit", "full-pr"]
+    context = ReviewContext.read(work / "review-context.json")
+    assert context.plan.scope == "full-pr"
+    assert context.loop is not None
+    assert context.loop.mode == "initial"
+    assert context.loop.round_number == 1
+    assert context.loop.severity_floor == "nit"
+    assert context.loop.prior_findings == ()
+    assert not (work / "model-override").exists()
+    assert "diff --git a/all b/all" in (work / "diff.patch").read_text(encoding="utf-8")
+
+
+def test_operational_verify_compare_failure_stops_before_model_artifacts_or_reset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from grok_pr_review.loop import Ledger, LedgerFinding, encode_ledger
+
+    old_sha = "a" * 40
+    head = "b" * 40
+    prior = encode_ledger(
+        Ledger(
+            2,
+            (LedgerFinding("r1-1", "risk", "src/app.py", 3, "Race", "open"),),
+            reviewed_sha=old_sha,
+        ),
+        repo="owner/repo",
+        pr_number=7,
+    )
+
+    class RateLimited(PipelineFailureGitHub):
+        def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
+            return [prior]
+
+    work = tmp_path / "work"
+    for name, value in {
+        "WORK": str(work),
+        "PR_NUMBER": "7",
+        "REVIEW_SCOPE": "latest-commit",
+        "MAX_DIFF_KB": "300",
+        "HEAD_SHA": head,
+        "EVENT_ACTION": "synchronize",
+        "GITHUB_REPOSITORY": "owner/repo",
+    }.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.delenv("GITHUB_EVENT_PATH", raising=False)
+    github = RateLimited()
+    monkeypatch.setattr(cli, "_github", lambda: github)
+    calls = 0
+
+    def rate_limited(**_kwargs: Any) -> CollectedReview:
+        nonlocal calls
+        calls += 1
+        raise GhError("GitHub API rate limit exceeded")
+
+    monkeypatch.setattr(cli, "collect_review_material", rate_limited)
+    assert cli.main(["collect"]) == 2
+    assert calls == 1  # no full-PR reset/retry on an operational failure
+    assert not (work / "review-context.json").exists()
+    assert not (work / "diff.patch").exists()
+    assert github.comment is not None
+    assert "rate limit" in github.comment[1]
 
 
 def test_stale_finish_posts_the_review_but_never_publishes_ledger_state(

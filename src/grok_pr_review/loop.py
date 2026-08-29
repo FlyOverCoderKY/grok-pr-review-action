@@ -333,6 +333,30 @@ def latest_ledger(bodies: list[str], *, repo: str, pr_number: int) -> Ledger | N
     return None
 
 
+def ledger_for_sha(
+    bodies: list[str], *, repo: str, pr_number: int, reviewed_sha: str
+) -> Ledger | None:
+    """Return the newest trustworthy ledger for ``reviewed_sha``.
+
+    Duplicate-run protection must search the bot's complete review history,
+    rather than only the current loop boundary. A force-push can move a PR
+    back to an earlier commit, and reviewing identical content twice is still
+    wasteful. As with :func:`latest_ledger`, a malformed marker fails closed
+    instead of being treated as permission to spend and post again.
+    """
+    target = reviewed_sha.strip().lower()
+    if not target:
+        return None
+    for body in reversed(bodies):
+        marker_present = LEDGER_PREFIX in body
+        ledger = extract_ledger(body, repo=repo, pr_number=pr_number)
+        if marker_present and ledger is None:
+            raise GhError("the review-loop ledger marker is corrupted")
+        if ledger is not None and ledger.reviewed_sha.strip().lower() == target:
+            return ledger
+    return None
+
+
 def _decode(token: str, *, repo: str, pr_number: int) -> Ledger | None:
     try:
         payload = json.loads(base64.b64decode(token, validate=True).decode("utf-8"))

@@ -5,10 +5,11 @@ from pathlib import Path
 import pytest
 
 from grok_pr_review.scope import (
-    COMPARE_FAILED_NOTICE,
+    HISTORY_DIVERGED_NOTICE,
     MISSING_BEFORE_NOTICE,
     DiffRequest,
     GhError,
+    HistoryDiverged,
     changed_paths,
     collect_review_material,
     plan_diff,
@@ -59,6 +60,12 @@ class CompareFails(FakeGitHub):
     def compare_diff(self, before: str, after: str) -> str:
         self.calls.append(("compare_diff", before, after))
         raise GhError("Not Found")
+
+
+class CompareDiverged(FakeGitHub):
+    def compare_diff(self, before: str, after: str) -> str:
+        self.calls.append(("compare_diff", before, after))
+        raise HistoryDiverged("not a linear fast-forward")
 
 
 def _names(fake: FakeGitHub) -> list[str]:
@@ -159,8 +166,25 @@ def test_collect_missing_before_uses_commit_api_not_pr_diff() -> None:
     assert "UNIQUE_FULL_PR_HUNK" not in collected.diff
 
 
-def test_compare_failure_falls_back_to_single_commit_not_full_pr() -> None:
+def test_operational_compare_failure_propagates_without_fetching_or_clearing_state() -> None:
     github = CompareFails()
+    with pytest.raises(GhError, match="Not Found"):
+        collect_review_material(
+            pr_number=7,
+            request=DiffRequest(
+                scope="latest-commit",
+                before_sha=BEFORE,
+                after_sha=AFTER,
+                head_sha=AFTER,
+            ),
+            max_diff_kb=300,
+            github=github,
+        )
+    assert _names(github) == ["pr_view", "compare_diff"]
+
+
+def test_proven_divergence_falls_back_to_single_commit_for_the_caller_to_reset() -> None:
+    github = CompareDiverged()
     collected = collect_review_material(
         pr_number=7,
         request=DiffRequest(
@@ -173,7 +197,7 @@ def test_compare_failure_falls_back_to_single_commit_not_full_pr() -> None:
         github=github,
     )
     assert collected.plan.kind == "single-commit"
-    assert collected.plan.fallback_notice == COMPARE_FAILED_NOTICE
+    assert collected.plan.fallback_notice == HISTORY_DIVERGED_NOTICE
     assert "pr_diff" not in _names(github)
     assert "UNIQUE_FULL_PR_HUNK" not in collected.diff
 
