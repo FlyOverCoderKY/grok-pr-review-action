@@ -10,10 +10,10 @@ authors = [{ name = "Nathan / RetireGolden, LLC" }]
 [project.optional-dependencies]
 dev = [
   "bandit==1.9.4",
-  "coverage==7.15.4",
+  "coverage==7.16.0",
   "mypy==2.3.1",
   "pytest==9.1.1",
-  "ruff==0.16.4",
+  "ruff==0.16.5",
 ]
 
 [build-system]
