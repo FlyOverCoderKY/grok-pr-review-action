@@ -13,11 +13,11 @@ dev = [
   "coverage==7.16.2",
   "mypy==2.4.0",
   "pytest==9.1.1",
-  "ruff==0.16.10",
+  "ruff==0.17.1",
 ]
 
 [build-system]
-requires = ["setuptools==84.0.0"]
+requires = ["setuptools==84.2.1"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
