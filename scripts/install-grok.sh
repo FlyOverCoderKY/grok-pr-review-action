@@ -58,7 +58,7 @@ load_bwrap_apparmor_profile() {
     if command -v apt-get >/dev/null 2>&1 && command -v sudo >/dev/null 2>&1; then
       echo "Installing apparmor-profiles and apparmor-utils so bwrap can use a userns AppArmor profile."
       if ! sudo apt-get update || ! sudo apt-get install -y apparmor-profiles apparmor-utils; then
-        echo "apt-get could not install apparmor-profiles/apparmor-utils; will try sysctl fallback." >&2
+        echo "apt-get could not install apparmor-profiles/apparmor-utils." >&2
       else
         hash -r
       fi
@@ -91,6 +91,10 @@ load_bwrap_apparmor_profile() {
 
 relax_unprivileged_userns_sysctl() {
   local sysctl_bin
+  if [[ "${ALLOW_RUNNER_SYSCTL:-false}" != "true" ]]; then
+    echo "Host user-namespace settings were left unchanged. Set allow_runner_sysctl: true only on a disposable runner to enable the sysctl fallback." >&2
+    return 1
+  fi
   if ! command -v sudo >/dev/null 2>&1; then
     echo "sudo is not available; cannot relax AppArmor unprivileged userns sysctls." >&2
     return 1
@@ -128,12 +132,12 @@ ensure_bwrap_userns() {
 
   if relax_unprivileged_userns_sysctl; then
     if bwrap_userns_works; then
-      echo "Enabled bwrap user namespaces by relaxing AppArmor unprivileged userns sysctls for this job."
+      echo "Enabled bwrap user namespaces by relaxing AppArmor unprivileged userns sysctls on this runner."
       return 0
     fi
   fi
 
-  echo "error: bwrap cannot set up a user namespace (uid map Permission denied). Ubuntu 24.04+ sets kernel.apparmor_restrict_unprivileged_userns=1, so unprivileged bwrap needs the bwrap-userns-restrict AppArmor profile or a relaxed sysctl. Tried loading that profile and relaxing the sysctl. Self-hosted runners must allow one of those remediations. Refusing to start Grok with the sandbox unenforced." >&2
+  echo "error: bwrap cannot set up a user namespace (uid map Permission denied). Configure the bwrap-userns-restrict AppArmor profile, or explicitly opt into allow_runner_sysctl on a disposable runner. Refusing to start Grok with the sandbox unenforced." >&2
   return 1
 }
 

@@ -36,6 +36,7 @@ class FakeGitHub:
             "url": "https://example.test/pr/7",
             "author": {"login": "nathan"},
             "headRefOid": AFTER,
+            "baseRefOid": BEFORE,
             "baseRefName": "main",
             "headRefName": "feature",
             "additions": 40,
@@ -43,8 +44,8 @@ class FakeGitHub:
             "changedFiles": 3,
         }
 
-    def pr_diff(self, number: int) -> str:
-        self.calls.append(("pr_diff", number))
+    def full_pr_diff(self, base: str, head: str) -> str:
+        self.calls.append(("full_pr_diff", base, head))
         return FULL_PR_DIFF
 
     def compare_diff(self, before: str, after: str) -> str:
@@ -72,7 +73,7 @@ def _names(fake: FakeGitHub) -> list[str]:
     return [str(call[0]) for call in fake.calls]
 
 
-def test_full_pr_plan_uses_gh_pr_diff() -> None:
+def test_full_pr_plan() -> None:
     plan = plan_diff(
         DiffRequest(scope="full-pr", before_sha=BEFORE, after_sha=AFTER, head_sha=AFTER)
     )
@@ -210,7 +211,8 @@ def test_collect_full_pr_embeds_the_full_fixture() -> None:
         max_diff_kb=300,
         github=github,
     )
-    assert "pr_diff" in _names(github)
+    assert ("full_pr_diff", BEFORE, AFTER) in github.calls
+    assert "pr_diff" not in _names(github)
     assert "UNIQUE_FULL_PR_HUNK" in collected.diff
 
 
@@ -344,7 +346,7 @@ def test_full_pr_fails_with_accurate_error_when_head_is_missing() -> None:
             self.views += 1
             self.calls.append(("pr_view", number))
             if self.views == 1:
-                return {"number": number, "headRefOid": AFTER}
+                return {"number": number, "headRefOid": AFTER, "baseRefOid": BEFORE}
             return {"number": number}
 
     with pytest.raises(GhError, match="head SHA is missing"):
@@ -366,7 +368,7 @@ def test_full_pr_fails_if_head_changes_during_collection() -> None:
             self.views += 1
             sha = AFTER if self.views == 1 else "c" * 40
             self.calls.append(("pr_view", (str(number),)))
-            return {"number": number, "headRefOid": sha}
+            return {"number": number, "headRefOid": sha, "baseRefOid": BEFORE}
 
     with pytest.raises(GhError, match="PR head changed"):
         collect_review_material(
@@ -399,3 +401,129 @@ def test_changed_paths_sees_renames_mode_changes_and_binary_files() -> None:
     )
     paths = changed_paths(diff)
     assert paths == {"src/app.py", "old_name.py", "new_name.py", "tool.sh", "asset.bin"}
+
+
+def test_changed_paths_decodes_git_quoted_headers_and_rename_metadata() -> None:
+    diff = (
+        'diff --git "a/old\\tname.py" "b/caf\\303\\251.py"\n'
+        'similarity index 100%\nrename from "old\\tname.py"\nrename to "caf\\303\\251.py"\n'
+        'diff --git a/space name.py "b/quote\\"name.py"\n'
+        '--- a/space name.py\t\n+++ "b/quote\\"name.py"\n'
+        "@@ -1 +1 @@\n--- a/hunk-content\n+++ b/hunk-content\n"
+    )
+    assert changed_paths(diff) == {"old\tname.py", "café.py", "space name.py", 'quote"name.py'}
+
+
+def test_quoted_generated_paths_share_header_parsing() -> None:
+    diff = 'diff --git "a/vendor/caf\\303\\251.py" "b/vendor/caf\\303\\251.py"\n' + "+x\n" * 1000
+    truncated = truncate_diff(diff, max_diff_kb=1)
+    assert truncated.stubbed_paths == ("vendor/café.py",)
+    assert changed_paths(truncated.text) == {"vendor/café.py"}
+
+
+@pytest.mark.parametrize(
+    "diff",
+    [
+        "unrecognized non-empty diff\n",
+        "diff --git invalid\n",
+        'diff --git "a/bad\\q.py" "b/bad\\q.py"\n',
+        'diff --git "a/bad\\377.py" "b/bad\\377.py"\n',
+        "diff --git a/good b/good\ndiff --git invalid\n",
+        "diff --git a/good b/good\n--- unexpected\n",
+        "diff --cc combined.py\n",
+        "diff --git a/good b/good\n@@ -1 +1 @@\n+x\ndiff --cc other.py\n",
+    ],
+)
+def test_changed_paths_rejects_unrecognized_nonempty_diffs(diff: str) -> None:
+    with pytest.raises(GhError):
+        changed_paths(diff)
+
+
+def test_changed_paths_preserves_spaces_and_handles_added_deleted_files() -> None:
+    assert changed_paths("") == set()
+    assert changed_paths(
+        "diff --git a/space b/name b/space b/name\n--- /dev/null\n+++ b/space b/name\t\n"
+        "diff --git a/deleted b/deleted\n--- a/deleted\n+++ /dev/null\n"
+    ) == {"space b/name", "deleted"}
+
+
+def test_rename_metadata_resolves_unquoted_paths_with_header_separators() -> None:
+    diff = (
+        "diff --git a/old b/name b/new b/name\n"
+        "similarity index 100%\nrename from old b/name\nrename to new b/name\n"
+    )
+    assert changed_paths(diff) == {"old b/name", "new b/name"}
+
+
+@pytest.mark.parametrize("operation", ["rename", "copy"])
+def test_generated_stubs_preserve_metadata_needed_for_path_parsing(operation: str) -> None:
+    diff = (
+        "diff --git a/vendor/old b/name b/vendor/new b/name\n"
+        f"{operation} from vendor/old b/name\n{operation} to vendor/new b/name\n"
+        "@@ -1 +1 @@\n" + "+data\n" * 1000
+    )
+    truncated = truncate_diff(diff, max_diff_kb=1)
+    assert truncated.stubbed_paths == ("vendor/new b/name",)
+    assert truncated.hard_cut is False
+    assert changed_paths(truncated.text) == {"vendor/old b/name", "vendor/new b/name"}
+
+
+def test_collection_rejects_an_unrecognized_nonempty_diff() -> None:
+    class UnrecognizedDiff(FakeGitHub):
+        def full_pr_diff(self, base: str, head: str) -> str:
+            return "diff --git unrecognized\n"
+
+    with pytest.raises(GhError, match="unrecognized"):
+        collect_review_material(
+            pr_number=7,
+            request=DiffRequest("full-pr", None, None, AFTER),
+            max_diff_kb=300,
+            github=UnrecognizedDiff(),
+        )
+
+
+def test_full_pr_fetch_stays_pinned_while_refs_move_and_return() -> None:
+    github = FakeGitHub()
+    collected = collect_review_material(
+        pr_number=7,
+        request=DiffRequest("full-pr", None, "c" * 40, "d" * 40),
+        max_diff_kb=300,
+        github=github,
+    )
+    assert github.calls == [("pr_view", 7), ("full_pr_diff", BEFORE, AFTER), ("pr_view", 7)]
+    assert collected.plan.to_sha == AFTER
+    assert collected.pr["baseRefOid"] == BEFORE
+
+
+@pytest.mark.parametrize("base", [None, "short", "a" * 7])
+def test_full_pr_requires_a_captured_full_base_sha(base: str | None) -> None:
+    class MissingBase(FakeGitHub):
+        def pr_view(self, number: int) -> dict[str, object]:
+            return {**super().pr_view(number), "baseRefOid": base}
+
+    github = MissingBase()
+    with pytest.raises(GhError, match="base SHA"):
+        collect_review_material(
+            pr_number=7,
+            request=DiffRequest("full-pr", None, None, AFTER),
+            max_diff_kb=300,
+            github=github,
+        )
+    assert _names(github) == ["pr_view"]
+
+
+def test_full_pr_fails_if_base_changes_during_collection() -> None:
+    class MovingBase(FakeGitHub):
+        def pr_view(self, number: int) -> dict[str, object]:
+            pr = super().pr_view(number)
+            if len(self.calls) > 1:
+                pr["baseRefOid"] = "c" * 40
+            return pr
+
+    with pytest.raises(GhError, match="PR base changed"):
+        collect_review_material(
+            pr_number=7,
+            request=DiffRequest("full-pr", None, None, AFTER),
+            max_diff_kb=300,
+            github=MovingBase(),
+        )

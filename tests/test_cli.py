@@ -629,7 +629,11 @@ def test_finish_verify_round_reports_resolutions_and_open_counts(
     assert "issue_count=1" in written
     assert "bug_count=1" in written
     assert "round=2" in written
-    ledger = extract_ledger(github.post_kwargs["hidden_marker"], repo="owner/repo", pr_number=7)
+    ledger = extract_ledger(
+        f"## Grok PR review — clean\n{github.post_kwargs['hidden_marker']}\n\nDone.",
+        repo="owner/repo",
+        pr_number=7,
+    )
     assert ledger is not None
     assert {finding.id for finding in ledger.findings} == {"r1-1"}
     report = "\n".join(github.post_kwargs["extra_lines"])
@@ -672,7 +676,7 @@ def test_collect_verify_round_reads_ledger_and_stages_verify_inputs(
 
     class LoopGitHub:
         def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
-            return [f"## Grok PR review\n{prior}\n"]
+            return [f"## Grok PR review — clean\n{prior}\n\nReview completed."]
 
         def list_finding_replies(self, _number: int) -> list[tuple[str, str, str]]:
             return [("r1-1", "codex-agent", "Not a real issue.")]
@@ -749,7 +753,7 @@ def test_preflight_and_prepost_guards_stop_a_concurrent_same_sha_wave(
     # to start. The first job posts while the second model call is in flight.
     assert cli.cmd_preflight() == 0
     assert "skip=false" in output.read_text(encoding="utf-8")
-    github.bodies = [marker]
+    github.bodies = [f"## Grok PR review — clean\n{marker}\n\nReview completed."]
     _write_completed_run(tmp_path)
 
     assert cli.cmd_finish() == 0
@@ -772,7 +776,7 @@ def test_preflight_skips_before_model_setup_and_force_review_bypasses_it(
 
     class AlreadyReviewed(RecordingGitHub):
         def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
-            return [marker]
+            return [f"## Grok PR review — clean\n{marker}\n\nReview completed."]
 
     output = tmp_path / "outputs"
     for name, value in {
@@ -802,7 +806,7 @@ def test_preflight_skips_before_model_setup_and_force_review_bypasses_it(
 
     class AlreadyReviewedWithBug(RecordingGitHub):
         def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
-            return [issues_marker]
+            return [f"## Grok PR review — clean\n{issues_marker}\n\nReview completed."]
 
     monkeypatch.setenv("FAIL_ON", "bugs")
     monkeypatch.setattr(cli, "_github", lambda: AlreadyReviewedWithBug())
@@ -850,7 +854,7 @@ def test_history_divergence_resets_verify_to_a_full_pr_round_one(
 
     class DivergedGitHub:
         def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
-            return [prior]
+            return [f"## Grok PR review — clean\n{prior}\n\nReview completed."]
 
     monkeypatch.setattr(cli, "_github", DivergedGitHub)
     scopes: list[str] = []
@@ -906,7 +910,7 @@ def test_operational_verify_compare_failure_stops_before_model_artifacts_or_rese
 
     class RateLimited(PipelineFailureGitHub):
         def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
-            return [prior]
+            return [f"## Grok PR review — clean\n{prior}\n\nReview completed."]
 
     work = tmp_path / "work"
     for name, value in {
@@ -1408,7 +1412,7 @@ def test_truncated_verify_push_escalates_even_below_the_line_threshold(
 
     class LoopGitHub:
         def list_bot_review_bodies(self, _number: int, _login: str) -> list[str]:
-            return [prior]
+            return [f"## Grok PR review — clean\n{prior}\n\nReview completed."]
 
         def list_finding_replies(self, _number: int) -> list[tuple[str, str, str]]:
             return []

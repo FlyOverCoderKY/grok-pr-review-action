@@ -300,16 +300,20 @@ def _encode(ledger: Ledger, findings: list[LedgerFinding], *, repo: str, pr_numb
 
 
 def has_ledger_marker(body: str) -> bool:
-    return LEDGER_PREFIX in body
+    return "<!-- grok-review-ledger:" in body
 
 
 def extract_ledger(body: str, *, repo: str, pr_number: int) -> Ledger | None:
-    """Decode the newest valid ledger marker bound to this repo/PR, else None."""
-    for match in reversed(list(_LEDGER_RE.finditer(body))):
-        ledger = _decode(match.group(1), repo=repo, pr_number=pr_number)
-        if ledger is not None:
-            return ledger
-    return None
+    """Decode one ledger directly below a completed review's heading."""
+    if body.count("<!-- grok-review-ledger:") != 1:
+        return None
+    lines = body.split("\n", 3)
+    if len(lines) < 4 or lines[2] != "":
+        return None
+    if not re.fullmatch(r"## Grok PR review — (?:clean|\d+ issue\(s\))", lines[0]):
+        return None
+    match = _LEDGER_RE.fullmatch(lines[1])
+    return _decode(match.group(1), repo=repo, pr_number=pr_number) if match else None
 
 
 def latest_ledger(bodies: list[str], *, repo: str, pr_number: int) -> Ledger | None:
@@ -348,7 +352,7 @@ def ledger_for_sha(
     if not target:
         return None
     for body in reversed(bodies):
-        marker_present = LEDGER_PREFIX in body
+        marker_present = has_ledger_marker(body)
         ledger = extract_ledger(body, repo=repo, pr_number=pr_number)
         if marker_present and ledger is None:
             raise GhError("the review-loop ledger marker is corrupted")

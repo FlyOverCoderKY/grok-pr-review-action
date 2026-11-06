@@ -48,6 +48,10 @@ inputs:
     description: "Extra prompt instructions (max 16,000 UTF-8 bytes; do not include secrets)."
     required: false
     default: ""
+  allow_runner_sysctl:
+    description: "Allow host-global user-namespace sysctl changes on disposable runners only."
+    required: false
+    default: "false"
   status_comments:
     description: "Post/update a live status comment on the PR."
     required: false
@@ -61,7 +65,7 @@ inputs:
   # in-action same-SHA checks are defense-in-depth, not an atomic lock.
   review_scope:
     description: >-
-      Diff to embed: full-pr (gh pr diff) or latest-commit (only the new
+      Diff to embed: full-pr (captured base/head SHA comparison) or latest-commit (only the new
       work on this push). A verify history proven non-linear by GitHub is
       visibly reset to a fresh full-PR round 1; operational compare failures
       fail closed. Initial rounds require full-pr.
@@ -162,7 +166,9 @@ runs:
         VERIFY_ESCALATION_LINES: ${{ inputs.verify_escalation_lines }}
         BOT_LOGIN: ${{ inputs.bot_login }}
         FORCE_REVIEW: ${{ inputs.force_review }}
-      run: python3 -m grok_pr_review validate-inputs
+        ALLOW_RUNNER_SYSCTL: ${{ inputs.allow_runner_sysctl }}
+      working-directory: ${{ github.action_path }}
+      run: python3 -P -m grok_pr_review validate-inputs
 
     - name: Check for an existing same-commit verdict
       id: preflight
@@ -178,20 +184,23 @@ runs:
         FORCE_REVIEW: ${{ inputs.force_review }}
         FAIL_ON: ${{ inputs.fail_on }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      run: python3 -m grok_pr_review preflight
+      working-directory: ${{ github.action_path }}
+      run: python3 -P -m grok_pr_review preflight
 
     - name: Require XAI_API_KEY
       if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         PYTHONPATH: ${{ github.action_path }}/src
-      run: python3 -m grok_pr_review check-auth
+      working-directory: ${{ github.action_path }}
+      run: python3 -P -m grok_pr_review check-auth
 
     - name: Install Grok CLI
       if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
         WORK: ${{ steps.dirs.outputs.work }}
+        ALLOW_RUNNER_SYSCTL: ${{ inputs.allow_runner_sysctl }}
       run: bash "${{ github.action_path }}/scripts/install-grok.sh" "$WORK"
 
     - name: Write Grok config.toml
@@ -202,7 +211,8 @@ runs:
         GROK_HOME: ${{ steps.dirs.outputs.grok_home }}
         MODEL: ${{ inputs.model }}
         VERIFY_MODEL: ${{ inputs.verify_model }}
-      run: python3 -m grok_pr_review write-config
+      working-directory: ${{ github.action_path }}
+      run: python3 -P -m grok_pr_review write-config
 
     - name: Collect PR context
       id: ctx
@@ -228,7 +238,8 @@ runs:
         VERIFY_EFFORT: ${{ inputs.verify_effort }}
         VERIFY_ESCALATION_LINES: ${{ inputs.verify_escalation_lines }}
         BOT_LOGIN: ${{ inputs.bot_login }}
-      run: python3 -m grok_pr_review collect
+      working-directory: ${{ github.action_path }}
+      run: python3 -P -m grok_pr_review collect
 
     - name: Prepare isolated review workspace
       if: ${{ steps.preflight.outputs.skip != 'true' }}
@@ -242,12 +253,14 @@ runs:
         PR_NUMBER: ${{ inputs.pr_number || github.event.pull_request.number }}
         GITHUB_TIMEOUT_SECONDS: ${{ inputs.github_timeout_seconds }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-      run: python3 -m grok_pr_review prepare-workspace
+      working-directory: ${{ github.action_path }}
+      run: python3 -P -m grok_pr_review prepare-workspace
 
     - name: Post status comment
       if: ${{ steps.preflight.outputs.skip != 'true' }}
       shell: bash
       env:
+        BOT_LOGIN: ${{ inputs.bot_login }}
         PYTHONPATH: ${{ github.action_path }}/src
         WORK: ${{ steps.dirs.outputs.work }}
         GH_TOKEN: ${{ inputs.github_token }}
@@ -258,7 +271,8 @@ runs:
         STATUS_COMMENTS: ${{ inputs.status_comments }}
         RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         GITHUB_TIMEOUT_SECONDS: ${{ inputs.github_timeout_seconds }}
-      run: python3 -m grok_pr_review start-status
+      working-directory: ${{ github.action_path }}
+      run: python3 -P -m grok_pr_review start-status
 
     - name: Build prompt
       if: ${{ steps.preflight.outputs.skip != 'true' }}
@@ -271,7 +285,8 @@ runs:
         ROAST_LEVEL: ${{ inputs.roast_level }}
         CUSTOM_INSTRUCTIONS: ${{ inputs.custom_instructions }}
         ALLOW_UNPROFESSIONAL_TONE: ${{ inputs.allow_unprofessional_tone }}
-      run: python3 -m grok_pr_review prompt
+      working-directory: ${{ github.action_path }}
+      run: python3 -P -m grok_pr_review prompt
 
     - name: Run Grok review
       if: ${{ steps.preflight.outputs.skip != 'true' }}
@@ -313,7 +328,8 @@ runs:
         GITHUB_TIMEOUT_SECONDS: ${{ inputs.github_timeout_seconds }}
         BOT_LOGIN: ${{ inputs.bot_login }}
         FORCE_REVIEW: ${{ inputs.force_review }}
-      run: python3 -m grok_pr_review finish
+      working-directory: ${{ github.action_path }}
+      run: python3 -P -m grok_pr_review finish
 
     - name: Cleanup temporary files
       if: ${{ always() }}

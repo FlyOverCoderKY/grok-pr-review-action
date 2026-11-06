@@ -11,6 +11,7 @@ from typing import Any
 
 from grok_pr_review.result import (
     ReviewResult,
+    escape_reserved_markers,
     extract_finding_marker,
     format_incomplete_comment_parts,
     format_review_body_parts,
@@ -32,6 +33,7 @@ class GitHubCli:
     ) -> None:
         self.repo = repo
         self.env = os.environ.copy() if env is None else dict(env)
+        self.bot_login = self.env.get("BOT_LOGIN", "github-actions[bot]")
         self.timeout_seconds = timeout_seconds
 
     def pr_view(self, number: int) -> dict[str, object]:
@@ -43,13 +45,23 @@ class GitHubCli:
                 "--repo",
                 self.repo,
                 "--json",
-                "number,title,body,url,author,headRefOid,baseRefName,headRefName,additions,deletions,changedFiles",
+                "number,title,body,url,author,headRefOid,baseRefOid,baseRefName,headRefName,additions,deletions,changedFiles",
             ]
         )
         return _json_object(raw, "gh pr view returned unexpected JSON")
 
     def pr_diff(self, number: int) -> str:
         return self._run(["pr", "diff", str(number), "--repo", self.repo])
+
+    def full_pr_diff(self, base: str, head: str) -> str:
+        """PR-style merge-base diff pinned to the captured commit pair."""
+        return self._api(
+            [
+                "-H",
+                "Accept: application/vnd.github.diff",
+                f"repos/{self.repo}/compare/{base}...{head}",
+            ]
+        )
 
     def compare_diff(self, before: str, after: str) -> str:
         endpoint = f"repos/{self.repo}/compare/{before}...{after}"
@@ -82,7 +94,12 @@ class GitHubCli:
         for comment in reversed(comments):
             body = comment.get("body")
             ident = comment.get("id")
-            if isinstance(body, str) and STATUS_MARKER in body and isinstance(ident, int):
+            if (
+                _comment_login(comment) == self.bot_login
+                and isinstance(body, str)
+                and _is_status_body(body)
+                and isinstance(ident, int)
+            ):
                 return ident
         return None
 
@@ -132,7 +149,9 @@ class GitHubCli:
         recent: list[tuple[str, str]] = []
         for comment in comments:
             body = comment.get("body")
-            if not isinstance(body, str) or STATUS_MARKER in body:
+            if not isinstance(body, str) or (
+                _comment_login(comment) == self.bot_login and _is_status_body(body)
+            ):
                 continue
             recent.append((_comment_login(comment), body))
         return recent[-limit:]
@@ -153,7 +172,7 @@ class GitHubCli:
         return [item for item in items if isinstance(item, dict)]
 
     def upsert_status_comment(self, pr_number: int, body: str, comment_id: int | None) -> int:
-        text = limit_github_body(f"{STATUS_MARKER}\n{body}")
+        text = limit_github_body(f"{STATUS_MARKER}\n{escape_reserved_markers(body)}")
         if comment_id is None:
             raw = self._api(
                 [
@@ -309,6 +328,13 @@ class GitHubCli:
             detail = (completed.stderr or completed.stdout or "gh failed").strip()
             raise GhError(detail[-2000:])
         return completed.stdout
+
+
+def _is_status_body(body: str) -> bool:
+    return (
+        body.startswith(STATUS_MARKER + "\n")
+        and body.count("<!-- grok-pr-review-action-status") == 1
+    )
 
 
 def _comment_login(comment: dict[str, Any]) -> str:

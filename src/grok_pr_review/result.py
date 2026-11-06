@@ -695,4 +695,15 @@ def _inline_code(value: str) -> str:
 
 
 def neutralize_mentions(value: str) -> str:
-    return value.replace("@", "@\u200b")
+    return escape_reserved_markers(value).replace("@", "@\u200b")
+
+
+def escape_reserved_markers(value: str) -> str:
+    """Keep display text distinct from action-generated control markers."""
+    for prefix in (
+        "<!-- grok-review-ledger:",
+        "<!-- grok-pr-review-action-status",
+        "<!-- grok-finding:",
+    ):
+        value = value.replace(prefix, prefix.replace("<", "&lt;", 1))
+    return value

@@ -1,8 +1,49 @@
 from __future__ import annotations
 
+import os
+import re
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("caller_cwd", [False, True])
+def test_python_steps_load_action_source_with_workspace_name_collisions(
+    tmp_path: Path, caller_cwd: bool
+) -> None:
+    workspace = tmp_path / "caller"
+    package = workspace / "grok_pr_review"
+    package.mkdir(parents=True)
+    sentinel = workspace / "imported"
+    collision = (
+        f"from pathlib import Path\nPath({str(sentinel)!r}).touch()\n"
+        "raise RuntimeError('collision')\n"
+    )
+    for path in (package / "__init__.py", package / "__main__.py", workspace / "sitecustomize.py"):
+        path.write_text(collision, encoding="utf-8")
+    text = (ROOT / "action.yml").read_text(encoding="utf-8")
+    steps = [step for step in text.split("    - name:") if "-m grok_pr_review" in step]
+    assert steps
+    for step in steps:
+        assert "working-directory: ${{ github.action_path }}" in step
+        assert "PYTHONPATH: ${{ github.action_path }}/src" in step
+        command = re.search(r"run: python3 -P -m grok_pr_review ([-a-z]+)", step)
+        assert command is not None
+        completed = subprocess.run(
+            [sys.executable, "-P", "-m", "grok_pr_review", command[1], "--help"],
+            cwd=workspace if caller_cwd else ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "src"), "GITHUB_WORKSPACE": str(workspace)},
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        assert "usage:" in completed.stdout
+        assert not sentinel.exists()
 
 
 def test_action_yml_uses_xai_api_key_not_supergrok() -> None:
@@ -85,7 +126,9 @@ def test_readme_explains_latest_commit_and_auth() -> None:
     assert "github-actions[bot]" in text
     assert "only trusted from reviews authored by" in text
     assert "prompt-cache miss" in text
-    assert "uses: FlyOverCoderKY/grok-pr-review-action@v1" in text
+    pins = re.findall(r"uses: FlyOverCoderKY/grok-pr-review-action@(\S+)", text)
+    assert len(pins) == 3
+    assert all(re.fullmatch(r"[0-9a-f]{40}", pin) for pin in pins)
     assert "@v1.0.0" in text
     assert "bubblewrap" in text
     assert "`bwrap`" in text

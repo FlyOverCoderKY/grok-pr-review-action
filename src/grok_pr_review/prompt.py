@@ -316,8 +316,8 @@ def _output_contract_lines(context: PromptContext) -> list[str]:
 def _scope_lines(plan: DiffPlan) -> list[str]:
     if plan.kind == "full-pr":
         return [
-            "This review is **full-pr**: the embedded diff is `gh pr diff` "
-            "for the whole pull request.",
+            "This review is **full-pr**: the embedded diff compares the captured "
+            "base/head commit SHAs for the whole pull request.",
         ]
     if plan.kind == "commit-range":
         return [

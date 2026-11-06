@@ -108,6 +108,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def cmd_validate_inputs() -> int:
     config = ActionConfig.from_env(os.environ)
+    parse_bool(os.environ.get("ALLOW_RUNNER_SYSCTL", "false"), "allow_runner_sysctl")
     print(
         "Validated action inputs "
         f"(pr={config.pr_number}, scope={config.review_scope}, "
