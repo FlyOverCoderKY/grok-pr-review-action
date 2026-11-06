@@ -254,7 +254,19 @@ fi
 exit 0
 SYSCTL
 chmod +x "$userns_sysctl/sysctl"
-PATH="$userns_sysctl" "$host_bash" "$repo_root/scripts/install-grok.sh" --ensure-bwrap \
+# The default must not invoke sysctl, even when it would make the probe pass.
+if PATH="$userns_sysctl" "$host_bash" "$repo_root/scripts/install-grok.sh" --ensure-bwrap \
+  >"$test_root/userns-default.out" 2>"$test_root/userns-default.err"; then
+  echo "ensure-bwrap changed host settings without opt-in" >&2
+  exit 1
+fi
+[[ ! -f "$BWRAP_USERNS_OK" && ! -f "$SYSCTL_LOG" ]]
+grep -q 'allow_runner_sysctl: true only on a disposable runner' "$test_root/userns-default.err"
+if [[ -f "$SUDO_LOG" ]] && grep -q 'sysctl' "$SUDO_LOG"; then
+  echo "default path invoked sysctl" >&2
+  exit 1
+fi
+ALLOW_RUNNER_SYSCTL=true PATH="$userns_sysctl" "$host_bash" "$repo_root/scripts/install-grok.sh" --ensure-bwrap \
   >"$test_root/userns-sysctl.out"
 [[ -f "$BWRAP_USERNS_OK" ]]
 grep -q 'relaxing AppArmor unprivileged userns sysctls' "$test_root/userns-sysctl.out"
@@ -281,7 +293,7 @@ printf '%s\n' "$*" >> "${SYSCTL_LOG:?}"
 exit 0
 SYSCTL
 chmod +x "$userns_fail/sysctl"
-if PATH="$userns_fail" "$host_bash" "$repo_root/scripts/install-grok.sh" --ensure-bwrap \
+if ALLOW_RUNNER_SYSCTL=true PATH="$userns_fail" "$host_bash" "$repo_root/scripts/install-grok.sh" --ensure-bwrap \
   >"$test_root/userns-fail.out" 2>"$test_root/userns-fail.err"; then
   echo "ensure-bwrap succeeded when uid maps still failed" >&2
   exit 1

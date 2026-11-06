@@ -15,7 +15,7 @@ It is an independent implementation. It does **not** require SuperGrok, `grok lo
 | First pass | `opened`, `reopened`, `ready_for_review` | `full-pr` | your repo default (`high` is common) |
 | Follow-up | `synchronize` | `latest-commit` | `low` |
 
-- `full-pr` (default) embeds `gh pr diff` for the whole pull request, capped by `max_diff_kb` (default 300). A truncated review receives a visible `partial` verdict and never appears clean.
+- `full-pr` (default) embeds a merge-base comparison of the captured base and head commit SHAs for the whole pull request, capped by `max_diff_kb` (default 300). A truncated review receives a visible `partial` verdict and never appears clean.
 - `latest-commit` embeds **only the new work on this push** when the ledger boundary is still an ancestor of the PR head. It prefers a linear range from the last ledgered SHA to the current head. A missing boundary degrades visibly to the single latest commit. If history has diverged after a force-push, the action does not run a narrow late-round verification: it visibly resets to a freshly pinned **full-PR round 1** at the `nit` floor.
 
 ## Auth
@@ -37,7 +37,7 @@ The action downloads the pinned Grok CLI 1.0.5 binary for Linux x86-64 or arm64 
 
 Linux runners also need [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) so Grok can enforce its strict OS sandbox deny list. GitHub-hosted Ubuntu images do not currently ship `bwrap`. The action installs the `bubblewrap` package with `sudo apt-get update && sudo apt-get install -y bubblewrap` when `bwrap` is missing. Self-hosted Linux runners must either provide `bwrap` on `PATH` or allow that passwordless `apt-get` install. If `bwrap` cannot be installed, the action fails closed and does **not** disable the sandbox.
 
-Ubuntu 24.04 and later (including GitHub-hosted `ubuntu-latest`) set `kernel.apparmor_restrict_unprivileged_userns=1`, so unprivileged `bwrap` cannot set up a uid map unless an AppArmor profile grants `userns`. The symptom is `bwrap: setting up uid map: Permission denied` ([Ubuntu bug #2144531](https://bugs.launchpad.net/ubuntu/+source/bubblewrap/+bug/2144531), [VS Code #316046](https://github.com/microsoft/vscode/issues/316046)). After `bwrap` is present, the action loads `/usr/share/apparmor/extra-profiles/bwrap-userns-restrict` into `/etc/apparmor.d/` when that extra profile is available (installing `apparmor-profiles` / `apparmor-utils` when needed) and runs `apparmor_parser -r`. If the profile cannot be loaded, it relaxes `kernel.apparmor_restrict_unprivileged_userns` for the job (`kernel.unprivileged_userns_clone=1` when that key exists). A short `bwrap --unshare-user` probe must succeed before Grok starts. The action still fails closed and does **not** disable `--sandbox strict`.
+Ubuntu 24.04 and later (including GitHub-hosted `ubuntu-latest`) set `kernel.apparmor_restrict_unprivileged_userns=1`, so unprivileged `bwrap` cannot set up a uid map unless an AppArmor profile grants `userns`. The symptom is `bwrap: setting up uid map: Permission denied` ([Ubuntu bug #2144531](https://bugs.launchpad.net/ubuntu/+source/bubblewrap/+bug/2144531), [VS Code #316046](https://github.com/microsoft/vscode/issues/316046)). After `bwrap` is present, the action loads `/usr/share/apparmor/extra-profiles/bwrap-userns-restrict` into `/etc/apparmor.d/` when that extra profile is available (installing `apparmor-profiles` / `apparmor-utils` when needed) and runs `apparmor_parser -r`. If the profile is insufficient, the action fails closed by default. On disposable runners only, `allow_runner_sysctl: true` explicitly permits the fallback to change host-global `kernel.apparmor_restrict_unprivileged_userns` and `kernel.unprivileged_userns_clone` settings. Those changes affect the runner host, not just the job. A short `bwrap --unshare-user` probe must succeed before Grok starts. The action still fails closed and does **not** disable `--sandbox strict`.
 
 ## Data sent to xAI
 
@@ -83,7 +83,7 @@ jobs:
 
       - name: First-pass review
         if: github.event.action != 'synchronize'
-        uses: FlyOverCoderKY/grok-pr-review-action@v1
+        uses: FlyOverCoderKY/grok-pr-review-action@799b32a6280aa690107e85893a9a87134551a5e0
         with:
           github_token: ${{ github.token }}
           pr_number: ${{ github.event.pull_request.number }}
@@ -95,7 +95,7 @@ jobs:
 
       - name: Follow-up review
         if: github.event.action == 'synchronize'
-        uses: FlyOverCoderKY/grok-pr-review-action@v1
+        uses: FlyOverCoderKY/grok-pr-review-action@799b32a6280aa690107e85893a9a87134551a5e0
         with:
           github_token: ${{ github.token }}
           pr_number: ${{ github.event.pull_request.number }}
@@ -106,7 +106,7 @@ jobs:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
 ```
 
-`@v1` is the intended consumer pin. Until the movable `v1` alias exists, pin the immutable `v1.0.0` tag (`FlyOverCoderKY/grok-pr-review-action@v1.0.0`) or a commit SHA. [RELEASING.md](RELEASING.md) tags immutable `v1.0.0` first, smoke-tests that tag, then moves `v1`.
+Pin the action to a full commit SHA, as in these examples, and update it deliberately after reviewing changes. The examples use commit `799b32a6280aa690107e85893a9a87134551a5e0`; choose the reviewed revision you intend to run. Tags such as `@v1` and `@v1.0.0` remain available for release discovery; see [RELEASING.md](RELEASING.md).
 
 The example above is a single job with two steps. Production and org reusable callers must use the [Required caller serialization](#required-caller-serialization) contract so overlapping triggers cannot create duplicate waves.
 
@@ -164,7 +164,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: FlyOverCoderKY/grok-pr-review-action@v1
+      - uses: FlyOverCoderKY/grok-pr-review-action@799b32a6280aa690107e85893a9a87134551a5e0
         with:
           pr_number: ${{ inputs.pr_number }}
           review_scope: ${{ inputs.event_action == 'synchronize' && 'latest-commit' || 'full-pr' }}
@@ -195,6 +195,7 @@ If branch protection needs a required check, publish a dedicated first-pass stat
 | `roast_level` | `professional` | Public-comment tone: `professional` \| `playful` \| `savage` \| `diabolical`. Prefer `professional` for contributor-facing repositories. |
 | `allow_unprofessional_tone` | `false` | Governance opt-in required for public `savage` or `diabolical` comments. |
 | `custom_instructions` | _empty_ | Extra prompt text (conventions, ignore rules), limited to 16,000 UTF-8 bytes. Never put secrets here. |
+| `allow_runner_sysctl` | `false` | Permit host-global user-namespace sysctl changes only on disposable runners when the AppArmor profile is insufficient. |
 | `status_comments` | `true` | Live “Grokking this…” comment. |
 | `max_diff_kb` | `300` | Embedded diff cap. Over-cap diffs first stub generated/large data files, then cut, with a notice. |
 | `review_scope` | `full-pr` | `full-pr` \| `latest-commit`. Initial rounds require `full-pr`; `latest-commit` is for verification rounds. |

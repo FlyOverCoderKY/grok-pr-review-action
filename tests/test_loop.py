@@ -35,6 +35,10 @@ def _finding(
     )
 
 
+def _review(marker: str) -> str:
+    return f"## Grok PR review — clean\n{marker}\n\nReview completed."
+
+
 def test_ledger_round_trips_through_the_hidden_marker() -> None:
     ledger = Ledger(
         round_number=2,
@@ -42,11 +46,37 @@ def test_ledger_round_trips_through_the_hidden_marker() -> None:
     )
     marker = encode_ledger(ledger, repo="owner/repo", pr_number=7)
     assert marker.startswith("<!-- grok-review-ledger:v1:")
-    body = f"## Grok PR review\n{marker}\n\nLooks good."
+    body = f"## Grok PR review — clean\n{marker}\n\nLooks good."
     decoded = extract_ledger(body, repo="owner/repo", pr_number=7)
     assert decoded == ledger
     assert extract_ledger(body, repo="other/repo", pr_number=7) is None
     assert extract_ledger(body, repo="owner/repo", pr_number=8) is None
+
+
+def test_ledger_requires_one_canonical_completed_review_marker() -> None:
+    import pytest
+
+    from grok_pr_review.scope import GhError
+
+    marker = encode_ledger(Ledger(1, ()), repo="owner/repo", pr_number=7)
+    canonical = _review(marker)
+    variants = [
+        marker,
+        "prefix\n" + canonical,
+        canonical + "\n" + marker,
+        canonical + "\n<!-- grok-review-ledger:v1:invalid -->",
+        canonical + "\n<!-- grok-review-ledger:v2:other -->",
+        canonical.replace("— clean", "— partial (0 issue(s))"),
+        canonical.replace("— clean", "incomplete"),
+        canonical.replace(f"{marker}\n\n", f"\n{marker}\n"),
+    ]
+    assert extract_ledger(canonical, repo="owner/repo", pr_number=7) == Ledger(1, ())
+    for body in variants:
+        assert extract_ledger(body, repo="owner/repo", pr_number=7) is None
+        with pytest.raises(GhError, match="corrupted"):
+            latest_ledger([canonical, body], repo="owner/repo", pr_number=7)
+        with pytest.raises(GhError, match="corrupted"):
+            ledger_for_sha([canonical, body], repo="owner/repo", pr_number=7, reviewed_sha="a" * 40)
 
 
 def test_malformed_or_absent_ledgers_are_ignored() -> None:
@@ -55,8 +85,11 @@ def test_malformed_or_absent_ledgers_are_ignored() -> None:
     assert extract_ledger("<!-- grok-review-ledger:v1:!!!notbase64!!! -->", **binding) is None
     good = encode_ledger(Ledger(1, (_finding("r1-1"),)), repo="owner/repo", pr_number=7)
     later = encode_ledger(Ledger(3, (_finding("r1-1"),)), repo="owner/repo", pr_number=7)
-    assert latest_ledger(["irrelevant", good, "codex review body", later], **binding) is not None
-    found = latest_ledger([good, later], **binding)
+    assert (
+        latest_ledger(["irrelevant", _review(good), "codex review body", _review(later)], **binding)
+        is not None
+    )
+    found = latest_ledger([_review(good), _review(later)], **binding)
     assert found is not None and found.round_number == 3
 
 
@@ -131,7 +164,7 @@ def test_apply_round_initial_assigns_ids_and_opens_the_ledger() -> None:
     assert outcome.result.verdict == "issues"
     assert outcome.extra_lines == []
     marker = encode_ledger(outcome.ledger, repo="owner/repo", pr_number=7)
-    assert extract_ledger(marker, repo="owner/repo", pr_number=7) == outcome.ledger
+    assert extract_ledger(_review(marker), repo="owner/repo", pr_number=7) == outcome.ledger
 
 
 def test_apply_round_verify_resolves_carries_and_enforces_the_floor() -> None:
@@ -241,7 +274,7 @@ def test_encode_ledger_preserves_open_findings_or_fails_visibly() -> None:
         for index in range(150)
     )
     marker = encode_ledger(Ledger(5, open_findings + disputed), repo="owner/repo", pr_number=7)
-    decoded = extract_ledger(marker, repo="owner/repo", pr_number=7)
+    decoded = extract_ledger(_review(marker), repo="owner/repo", pr_number=7)
     assert decoded is not None
     kept_open = [f for f in decoded.findings if f.status == "open"]
     assert len(kept_open) == 120  # every open finding survives; disputed may be dropped
@@ -268,8 +301,8 @@ def test_latest_ledger_fails_on_a_corrupt_newest_marker_instead_of_rolling_back(
     older = encode_ledger(Ledger(2, (_finding("r1-1"),)), repo="owner/repo", pr_number=7)
     corrupt = "<!-- grok-review-ledger:v1:AAAA -->"
     with pytest.raises(GhError, match="corrupted"):
-        latest_ledger([older, corrupt], repo="owner/repo", pr_number=7)
-    recovered = latest_ledger([corrupt, older], repo="owner/repo", pr_number=7)
+        latest_ledger([_review(older), corrupt], repo="owner/repo", pr_number=7)
+    recovered = latest_ledger([corrupt, _review(older)], repo="owner/repo", pr_number=7)
     assert recovered is not None and recovered.round_number == 2
 
 
@@ -287,12 +320,17 @@ def test_ledger_for_sha_searches_all_bot_reviews_and_fails_closed() -> None:
     )
     new = encode_ledger(Ledger(2, (), reviewed_sha=new_sha), repo="owner/repo", pr_number=7)
     assert ledger_for_sha(
-        [old, new], repo="owner/repo", pr_number=7, reviewed_sha=old_sha.upper()
+        [_review(old), _review(new)], repo="owner/repo", pr_number=7, reviewed_sha=old_sha.upper()
     ) == Ledger(1, (_finding("r1-1"),), reviewed_sha=old_sha)
-    assert ledger_for_sha([old, new], repo="owner/repo", pr_number=7, reviewed_sha="c" * 40) is None
+    assert (
+        ledger_for_sha(
+            [_review(old), _review(new)], repo="owner/repo", pr_number=7, reviewed_sha="c" * 40
+        )
+        is None
+    )
     with pytest.raises(GhError, match="corrupted"):
         ledger_for_sha(
-            [old, "<!-- grok-review-ledger:v1:AAAA -->"],
+            [_review(old), "<!-- grok-review-ledger:v1:AAAA -->"],
             repo="owner/repo",
             pr_number=7,
             reviewed_sha=old_sha,

@@ -38,7 +38,7 @@ class HistoryDiverged(GhError):
 class GitHubPort(Protocol):
     def pr_view(self, number: int) -> dict[str, object]: ...
 
-    def pr_diff(self, number: int) -> str: ...
+    def full_pr_diff(self, base: str, head: str) -> str: ...
 
     def compare_diff(self, before: str, after: str) -> str: ...
 
@@ -256,16 +256,25 @@ def _stub_generated_hunks(diff: str) -> tuple[str, tuple[str, ...]]:
         if header is None:
             pieces.append(body)
             continue
-        path = _header_path(header)
+        path = _header_paths(header, body)[1]
         section = header + body
-        if path is None or not _should_stub(path, len(section.encode("utf-8"))):
+        if not _should_stub(path, len(section.encode("utf-8"))):
             pieces.append(section)
             continue
+        metadata: list[str] = []
+        for line in body.splitlines(keepends=True):
+            if line.startswith(("@@", "GIT binary patch", "Binary files ")):
+                break
+            if line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+                metadata.append(line)
+        kept_metadata = "".join(metadata)
         hunks = sum(1 for line in body.splitlines() if line.startswith("@@"))
-        omitted = len(body.encode("utf-8"))
+        omitted = len(body.encode("utf-8")) - len(kept_metadata.encode("utf-8"))
         stubbed.append(path)
         pieces.append(
-            header + f"# {hunks} hunk(s), {omitted} bytes omitted (generated or large data "
+            header
+            + kept_metadata
+            + f"# {hunks} hunk(s), {omitted} bytes omitted (generated or large data "
             "file); this file is still part of the diff - account for it in "
             "coverage and inspect it with tools if it needs review\n"
         )
@@ -281,6 +290,8 @@ def _file_sections(diff: str) -> list[tuple[str | None, str]]:
     header: str | None = None
     body: list[str] = []
     for line in diff.splitlines(keepends=True):
+        if line.startswith("diff --") and not line.startswith("diff --git "):
+            raise GhError("unrecognized diff file header")
         if line.startswith("diff --git "):
             if header is not None or body:
                 sections.append((header, "".join(body)))
@@ -293,10 +304,84 @@ def _file_sections(diff: str) -> list[tuple[str | None, str]]:
     return sections
 
 
-def _header_path(header: str) -> str | None:
-    remainder = header[len("diff --git a/") :] if header.startswith("diff --git a/") else ""
-    _left, separator, right = remainder.rstrip("\n").rpartition(" b/")
-    return right if separator and right else None
+_QUOTED_PATH_RE = re.compile(r'"(?:[^"\\]|\\.)*"')
+_GIT_ESCAPES = {"a": 7, "b": 8, "t": 9, "n": 10, "v": 11, "f": 12, "r": 13, '"': 34, "\\": 92}
+
+
+def _decode_path(value: str) -> str:
+    if not value.startswith('"'):
+        if not value:
+            raise GhError("empty diff path")
+        return value
+    if not _QUOTED_PATH_RE.fullmatch(value):
+        raise GhError("unrecognized quoted diff path")
+    data = bytearray()
+    index = 1
+    while index < len(value) - 1:
+        character = value[index]
+        if character != "\\":
+            data.extend(character.encode("utf-8"))
+            index += 1
+            continue
+        index += 1
+        escaped = value[index]
+        if escaped in _GIT_ESCAPES:
+            data.append(_GIT_ESCAPES[escaped])
+            index += 1
+        else:
+            octal = value[index : index + 3]
+            if not re.fullmatch(r"[0-3][0-7]{2}", octal):
+                raise GhError("unrecognized diff path escape")
+            data.append(int(octal, 8))
+            index += 3
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise GhError("diff path is not UTF-8") from exc
+
+
+def _header_paths(header: str, body: str) -> tuple[str, str]:
+    remainder = header.removeprefix("diff --git ").removesuffix("\n")
+    if remainder.startswith('"'):
+        match = _QUOTED_PATH_RE.match(remainder)
+        if match is None or remainder[match.end() : match.end() + 1] != " ":
+            raise GhError("unrecognized diff --git header")
+        left, right = match.group(), remainder[match.end() + 1 :]
+    elif ' "b/' in remainder:
+        left, _, right = remainder.partition(' "b/')
+        right = '"b/' + right
+    else:
+        # Git leaves ordinary spaces unquoted. Rename/copy metadata resolves
+        # the split when either path itself contains ' b/'.
+        candidates = [
+            (remainder[: match.start()], remainder[match.start() + 1 :])
+            for match in re.finditer(" b/", remainder)
+        ]
+        metadata: dict[str, str] = {}
+        for line in body.splitlines():
+            if line.startswith(("@@", "GIT binary patch", "Binary files ")):
+                break
+            match = re.fullmatch(r"(?:rename|copy) (from|to) (.+)", line)
+            if match:
+                metadata[match[1]] = _decode_path(match[2])
+        if set(metadata) == {"from", "to"}:
+            matches = [
+                (a, b)
+                for a, b in candidates
+                if a == f"a/{metadata['from']}" and b == f"b/{metadata['to']}"
+            ]
+        else:
+            matches = [(a, b) for a, b in candidates if a[2:] == b[2:]]
+        if len(matches) == 1:
+            left, right = matches[0]
+        elif len(candidates) == 1:
+            left, right = candidates[0]
+        else:
+            raise GhError("unrecognized or ambiguous diff --git header")
+    old, new = _decode_path(left), _decode_path(right)
+    if not old.startswith("a/") or not new.startswith("b/") or not old[2:] or not new[2:]:
+        raise GhError("unrecognized diff --git path prefixes")
+    return old[2:], new[2:]
 
 
 def _should_stub(path: str, section_bytes: int) -> bool:
@@ -333,30 +418,45 @@ def changed_paths(diff_text: str) -> set[str]:
     no `---`/`+++` pair) are still accounted for.
     """
     paths: set[str] = set()
-    for line in diff_text.splitlines():
-        if line.startswith("diff --git a/"):
-            remainder = line[len("diff --git a/") :]
-            left, separator, right = remainder.rpartition(" b/")
-            if separator:
-                paths.add(left)
-                paths.add(right)
-        elif line.startswith(("--- a/", "+++ b/")):
-            paths.add(line[6:])
-        elif line.startswith("rename from "):
-            paths.add(line[len("rename from ") :])
-        elif line.startswith("rename to "):
-            paths.add(line[len("rename to ") :])
-    return {path.strip() for path in paths if path.strip()}
+    for header, body in _file_sections(diff_text):
+        if header is None:
+            if body.strip():
+                raise GhError("non-empty diff has unrecognized file headers")
+            continue
+        paths.update(_header_paths(header, body))
+        for line in body.splitlines():
+            if line.startswith(("@@", "GIT binary patch", "Binary files ")):
+                break
+            if line.startswith(("--- ", "+++ ")):
+                value = line[4:].removesuffix("\t")
+                path = _decode_path(value)
+                prefix = "a/" if line.startswith("--- ") else "b/"
+                if path == "/dev/null":
+                    continue
+                if not path.startswith(prefix) or not path[2:]:
+                    raise GhError("unrecognized diff file header")
+                paths.add(path[2:])
+            elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+                paths.add(_decode_path(line.split(" ", 2)[2]))
+            elif line.startswith("diff "):
+                raise GhError("unrecognized diff file header")
+    if diff_text.strip() and not paths:
+        raise GhError("non-empty diff has no recognized paths")
+    return paths
 
 
 def fetch_scoped_diff(
     pr_number: int,
     plan: DiffPlan,
     github: GitHubPort,
+    *,
+    base_sha: str | None = None,
 ) -> tuple[str, DiffPlan]:
     """Return (diff, maybe-updated plan). latest-commit never calls pr_diff."""
     if plan.kind == "full-pr":
-        return github.pr_diff(pr_number), plan
+        if base_sha is None or plan.to_sha is None:
+            raise GhError("full-PR diff requires captured base and head SHAs")
+        return github.full_pr_diff(base_sha, plan.to_sha), plan
 
     if plan.kind == "commit-range":
         if plan.from_sha is None or plan.to_sha is None:
@@ -383,9 +483,14 @@ def collect_review_material(
 ) -> CollectedReview:
     pr = github.pr_view(pr_number)
     head_from_pr = normalize_sha(_as_str(pr.get("headRefOid")))
+    base_from_pr = normalize_sha(_as_str(pr.get("baseRefOid")))
     full_pr = request.scope == "full-pr"
     if full_pr and head_from_pr is None:
         raise GhError("PR head SHA is missing from the PR metadata; retry the review")
+    if full_pr and (base_from_pr is None or len(base_from_pr) != 40):
+        raise GhError("PR base SHA is missing from the PR metadata; retry the review")
+    if full_pr and head_from_pr is not None and len(head_from_pr) != 40:
+        raise GhError("PR head SHA must be a full commit SHA; retry the review")
     plan = plan_diff(
         DiffRequest(
             scope=request.scope,
@@ -394,7 +499,8 @@ def collect_review_material(
             head_sha=head_from_pr if full_pr else request.head_sha or head_from_pr,
         )
     )
-    raw, plan = fetch_scoped_diff(pr_number, plan, github)
+    raw, plan = fetch_scoped_diff(pr_number, plan, github, base_sha=base_from_pr)
+    changed_paths(raw)
     if full_pr:
         confirmed_pr = github.pr_view(pr_number)
         confirmed_head = normalize_sha(_as_str(confirmed_pr.get("headRefOid")))
@@ -402,6 +508,8 @@ def collect_review_material(
             raise GhError("PR head SHA is missing from the PR metadata; retry the review")
         if confirmed_head != plan.to_sha:
             raise GhError("PR head changed while collecting the full-PR diff; retry the review")
+        if normalize_sha(_as_str(confirmed_pr.get("baseRefOid"))) != base_from_pr:
+            raise GhError("PR base changed while collecting the full-PR diff; retry the review")
         pr = confirmed_pr
     return CollectedReview(pr=pr, plan=plan, truncation=truncate_diff(raw, max_diff_kb))
 

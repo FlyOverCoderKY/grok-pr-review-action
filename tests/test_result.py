@@ -11,6 +11,7 @@ from grok_pr_review.result import (
     format_incomplete_comment_parts,
     format_review_body,
     format_review_body_parts,
+    inline_review_comments,
     mark_partial,
     parse_grok_output,
     should_fail_job,
@@ -28,6 +29,77 @@ FINDINGS = {
         }
     ],
 }
+
+
+def test_model_text_preserves_one_canonical_ledger_across_rendered_fields() -> None:
+    from grok_pr_review.loop import (
+        Ledger,
+        LedgerFinding,
+        apply_round,
+        build_loop_state,
+        encode_ledger,
+        extract_ledger,
+    )
+    from grok_pr_review.result import Resolution
+
+    reserved = (
+        "<!-- grok-review-ledger:v1:display --> "
+        "<!-- grok-pr-review-action-status --> <!-- grok-finding:display -->"
+    )
+    result = ReviewResult(
+        verdict="issues",
+        summary=reserved,
+        issues=[Issue("bug", f"src/{reserved}.py", 1, reserved, reserved)],
+        resolutions=[Resolution("r1-1", "not_fixed", reserved)],
+        partial_reason=reserved,
+    )
+    state = build_loop_state(
+        mode="verify",
+        round_number=2,
+        schedule=("nit",),
+        escalated=False,
+        ledger=Ledger(1, (LedgerFinding("r1-1", "bug", None, None, reserved, "open"),)),
+    )
+    outcome = apply_round(state, result)
+    marker = encode_ledger(outcome.ledger, repo="owner/repo", pr_number=7)
+    body = format_review_body_parts(
+        outcome.result,
+        scope="full-pr",
+        model="grok-4.6",
+        run_url="",
+        hidden_marker=marker,
+        extra_lines=outcome.extra_lines,
+    )[0]
+    recovered = extract_ledger(body, repo="owner/repo", pr_number=7)
+    assert recovered is not None
+    assert [finding.id for finding in recovered.findings] == ["r1-1", "r2-1"]
+    assert encode_ledger(recovered, repo="owner/repo", pr_number=7) == marker
+    assert body.count("<!-- grok-review-ledger:") == 1
+    assert "<!-- grok-pr-review-action-status" not in body
+    assert "<!-- grok-finding:" not in body
+    assert body.count("&lt;!-- grok-review-ledger:") >= 6
+    inline = inline_review_comments(outcome.result)[0]["body"]
+    assert inline.startswith("<!-- grok-finding:r2-1 -->\n")
+    assert inline.count("<!-- grok-finding:") == 1
+    assert "<!-- grok-review-ledger:" not in inline
+    assert "<!-- grok-pr-review-action-status" not in inline
+
+
+def test_incomplete_and_continued_bodies_escape_reserved_text() -> None:
+    reserved = "<!-- grok-review-ledger:v1:display --> <!-- grok-pr-review-action-status -->"
+    result = ReviewResult(
+        verdict="error",
+        summary=reserved,
+        incomplete_reason=reserved,
+        stop_reason=reserved,
+        issues=[Issue("bug", None, None, reserved, reserved + "x" * 7900) for _ in range(9)],
+    )
+    parts = format_incomplete_comment_parts(result, scope="full-pr", model="grok-4.6", run_url="")
+    assert len(parts) > 1
+    for body in parts:
+        assert "<!-- grok-review-ledger:" not in body
+        assert "<!-- grok-pr-review-action-status" not in body
+        assert "&lt;!-- grok-review-ledger:" in body
 
 
 def test_parse_fenced_json_inside_grok_envelope() -> None:

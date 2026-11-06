@@ -30,13 +30,80 @@ def test_find_status_comment_flattens_pages_and_uses_latest_marker() -> None:
     github.responses = [
         json.dumps(
             [
-                [{"id": 1, "body": f"{STATUS_MARKER}\nold"}],
-                [{"id": 2, "body": "ordinary"}, {"id": 3, "body": STATUS_MARKER}],
+                [
+                    {
+                        "id": 1,
+                        "body": f"{STATUS_MARKER}\nold",
+                        "user": {"login": "github-actions[bot]"},
+                    }
+                ],
+                [
+                    {"id": 2, "body": "ordinary"},
+                    {
+                        "id": 3,
+                        "body": f"{STATUS_MARKER}\nnew",
+                        "user": {"login": "github-actions[bot]"},
+                    },
+                ],
             ]
         )
     ]
     assert github.find_status_comment(7) == 3
     assert github.calls[0][0][:2] == ["--paginate", "--slurp"]
+
+
+@pytest.mark.parametrize("login", ["github-actions[bot]", "custom-review-bot"])
+def test_status_lookup_requires_configured_author_and_one_leading_marker(login: str) -> None:
+    github = StubGitHub()
+    github.bot_login = login
+    github.responses = [
+        json.dumps(
+            [
+                [
+                    {"id": 1, "body": f"{STATUS_MARKER}\nvalid", "user": {"login": login}},
+                    {
+                        "id": 2,
+                        "body": f"{STATUS_MARKER}\nother author",
+                        "user": {"login": "contributor"},
+                    },
+                    {"id": 3, "body": f"text\n{STATUS_MARKER}\ntext", "user": {"login": login}},
+                    {
+                        "id": 4,
+                        "body": f"{STATUS_MARKER}\n{STATUS_MARKER}",
+                        "user": {"login": login},
+                    },
+                    {"id": 5, "body": f"{STATUS_MARKER}\nmissing author"},
+                ]
+            ]
+        )
+    ]
+    assert github.find_status_comment(7) == 1
+
+
+def test_status_body_escapes_reserved_text() -> None:
+    github = StubGitHub()
+    github.responses = [json.dumps({"id": 9})]
+    github.upsert_status_comment(7, f"details {STATUS_MARKER}", None)
+    body = next(arg.removeprefix("body=") for arg in github.calls[0][0] if arg.startswith("body="))
+    assert body.startswith(STATUS_MARKER + "\n")
+    assert body.count(STATUS_MARKER) == 1
+    assert "&lt;!-- grok-pr-review-action-status" in body
+
+
+def test_full_pr_diff_uses_pinned_compare_without_linear_history_requirement() -> None:
+    github = StubGitHub()
+    github.responses = ["merge-base diff"]
+    assert github.full_pr_diff("a" * 40, "b" * 40) == "merge-base diff"
+    assert github.calls == [
+        (
+            [
+                "-H",
+                "Accept: application/vnd.github.diff",
+                f"repos/owner/repo/compare/{'a' * 40}...{'b' * 40}",
+            ],
+            None,
+        )
+    ]
 
 
 def test_upsert_status_creates_a_new_comment_when_marker_cannot_be_edited() -> None:

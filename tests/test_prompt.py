@@ -67,7 +67,7 @@ def test_full_pr_prompt_embeds_full_fixture() -> None:
     prompt = _prompt(plan, FULL_PR_DIFF)
     assert "UNIQUE_FULL_PR_HUNK" in prompt
     assert "full-pr" in prompt
-    assert "gh pr diff" in prompt
+    assert "captured base/head commit SHAs" in prompt
 
 
 def test_missing_before_prompt_states_the_fallback() -> None:
