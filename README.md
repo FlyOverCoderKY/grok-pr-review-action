@@ -83,7 +83,7 @@ jobs:
 
       - name: First-pass review
         if: github.event.action != 'synchronize'
-        uses: FlyOverCoderKY/grok-pr-review-action@799b32a6280aa690107e85893a9a87134551a5e0
+        uses: FlyOverCoderKY/grok-pr-review-action@89581d314d38315d41b4473871d4c0862cba0e52
         with:
           github_token: ${{ github.token }}
           pr_number: ${{ github.event.pull_request.number }}
@@ -95,7 +95,7 @@ jobs:
 
       - name: Follow-up review
         if: github.event.action == 'synchronize'
-        uses: FlyOverCoderKY/grok-pr-review-action@799b32a6280aa690107e85893a9a87134551a5e0
+        uses: FlyOverCoderKY/grok-pr-review-action@89581d314d38315d41b4473871d4c0862cba0e52
         with:
           github_token: ${{ github.token }}
           pr_number: ${{ github.event.pull_request.number }}
@@ -106,7 +106,7 @@ jobs:
           XAI_API_KEY: ${{ secrets.XAI_API_KEY }}
 ```
 
-Pin the action to a full commit SHA, as in these examples, and update it deliberately after reviewing changes. The examples use commit `799b32a6280aa690107e85893a9a87134551a5e0`; choose the reviewed revision you intend to run. Tags such as `@v1` and `@v1.0.0` remain available for release discovery; see [RELEASING.md](RELEASING.md).
+Pin the action to a full commit SHA, as in these examples, and update it deliberately after reviewing changes. The examples use commit `89581d314d38315d41b4473871d4c0862cba0e52`; choose the reviewed revision you intend to run. Tags such as `@v1` and `@v1.0.0` remain available for release discovery; see [RELEASING.md](RELEASING.md).
 
 The example above is a single job with two steps. Production and org reusable callers must use the [Required caller serialization](#required-caller-serialization) contract so overlapping triggers cannot create duplicate waves.
 
@@ -164,7 +164,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - uses: FlyOverCoderKY/grok-pr-review-action@799b32a6280aa690107e85893a9a87134551a5e0
+      - uses: FlyOverCoderKY/grok-pr-review-action@89581d314d38315d41b4473871d4c0862cba0e52
         with:
           pr_number: ${{ inputs.pr_number }}
           review_scope: ${{ inputs.event_action == 'synchronize' && 'latest-commit' || 'full-pr' }}

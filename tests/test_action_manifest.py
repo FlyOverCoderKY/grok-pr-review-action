@@ -126,10 +126,9 @@ def test_readme_explains_latest_commit_and_auth() -> None:
     assert "github-actions[bot]" in text
     assert "only trusted from reviews authored by" in text
     assert "prompt-cache miss" in text
-    assert (
-        "uses: FlyOverCoderKY/grok-pr-review-action@799b32a6280aa690107e85893a9a87134551a5e0"
-        in text
-    )
+    pins = re.findall(r"uses: FlyOverCoderKY/grok-pr-review-action@(\S+)", text)
+    assert len(pins) == 3
+    assert all(re.fullmatch(r"[0-9a-f]{40}", pin) for pin in pins)
     assert "@v1.0.0" in text
     assert "bubblewrap" in text
     assert "`bwrap`" in text
